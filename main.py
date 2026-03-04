@@ -115,6 +115,7 @@ class SheetEditor(ctk.CTkFrame):
         self.current_master_idx = None
         self.current_master_pk = None
         self.current_image_ref = None
+        self.current_sub_row_idx = None  # 子表行選中索引
         self._master_suppress = False  # suppress-flag for master field callbacks
 
         # 母表UI緩存
@@ -151,8 +152,10 @@ class SheetEditor(ctk.CTkFrame):
         # 左側操作按鈕
         btn_box_left = ctk.CTkFrame(self.frame_left, height=40, fg_color="transparent")
         btn_box_left.pack(fill="x", pady=5, padx=2)
-        ctk.CTkButton(btn_box_left, text="+", width=50, fg_color="green", command=self.add_classification).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_left, text="-", width=50, fg_color="darkred", command=self.delete_classification).pack(side="right", padx=2, expand=True)
+        ctk.CTkButton(btn_box_left, text="+", width=40, fg_color="green", command=self.add_classification).pack(side="left", padx=2, expand=True)
+        ctk.CTkButton(btn_box_left, text="-", width=40, fg_color="darkred", command=self.delete_classification).pack(side="left", padx=2, expand=True)
+        ctk.CTkButton(btn_box_left, text="▲", width=30, command=lambda: self.move_classification(-1)).pack(side="left", padx=2, expand=True)
+        ctk.CTkButton(btn_box_left, text="▼", width=30, command=lambda: self.move_classification(1)).pack(side="left", padx=2, expand=True)
 
         # --- 中間：項目清單 ---
         self.frame_mid = ctk.CTkFrame(self, width=200)
@@ -162,11 +165,17 @@ class SheetEditor(ctk.CTkFrame):
         self.scroll_items = LightScrollableFrame(self.frame_mid)
         self.scroll_items.pack(fill="both", expand=True)
 
-        # 中間操作按鈕
-        btn_box_mid = ctk.CTkFrame(self.frame_mid, height=40, fg_color="transparent")
-        btn_box_mid.pack(fill="x", pady=5, padx=2)
-        ctk.CTkButton(btn_box_mid, text="新增項目", width=80, fg_color="green", command=self.add_master_item).pack(side="left", padx=2, fill="x", expand=True)
-        ctk.CTkButton(btn_box_mid, text="刪除", width=60, fg_color="darkred", command=self.delete_master_item).pack(side="right", padx=2)
+        # 中間操作按鈕 — 上排：新增/複製  下排：排序/刪除
+        btn_box_mid_top = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
+        btn_box_mid_top.pack(fill="x", pady=(5, 0), padx=2)
+        ctk.CTkButton(btn_box_mid_top, text="新增項目", width=80, fg_color="green", command=self.add_master_item).pack(side="left", padx=2, fill="x", expand=True)
+        ctk.CTkButton(btn_box_mid_top, text="複製", width=60, command=self.copy_master_item).pack(side="right", padx=2)
+
+        btn_box_mid_bot = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
+        btn_box_mid_bot.pack(fill="x", pady=(2, 5), padx=2)
+        ctk.CTkButton(btn_box_mid_bot, text="▲", width=30, command=lambda: self.move_master_item(-1)).pack(side="left", padx=2, expand=True)
+        ctk.CTkButton(btn_box_mid_bot, text="▼", width=30, command=lambda: self.move_master_item(1)).pack(side="left", padx=2, expand=True)
+        ctk.CTkButton(btn_box_mid_bot, text="刪除", width=60, fg_color="darkred", command=self.delete_master_item).pack(side="right", padx=2)
 
         # --- 右區：編輯區 (上:母表 / 下:子表) ---
         self.frame_right = ctk.CTkFrame(self)
@@ -174,17 +183,20 @@ class SheetEditor(ctk.CTkFrame):
 
         # 右上：母表資料
         ctk.CTkLabel(self.frame_right, text="[母表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
-        self.top_container = ctk.CTkFrame(self.frame_right, height=100, fg_color="transparent")
-        self.top_container.pack(fill="x", expand=False, padx=5, pady=5)
+        self.top_container = ctk.CTkFrame(self.frame_right, fg_color="transparent")
+        self.top_container.pack(fill="both", expand=True, padx=5, pady=5)
 
         # 右下：子表資料 (標題區含新增按鈕)
         sub_header_frame = ctk.CTkFrame(self.frame_right, fg_color="transparent")
         sub_header_frame.pack(fill="x", pady=2, padx=5)
 
         ctk.CTkLabel(sub_header_frame, text="[子表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
-        # 子表新增按鈕
+        # 子表新增按鈕 + 行操作按鈕（與原版同層：label 在上，按鈕在下方 side=right）
         ctk.CTkButton(sub_header_frame, text="+ 新增子表資料", width=100, height=24, fg_color="green",
                       command=self.add_sub_item).pack(side="right")
+        ctk.CTkButton(sub_header_frame, text="▼", width=30, height=24, command=lambda: self.move_sub_item(1)).pack(side="right", padx=2)
+        ctk.CTkButton(sub_header_frame, text="▲", width=30, height=24, command=lambda: self.move_sub_item(-1)).pack(side="right", padx=2)
+        ctk.CTkButton(sub_header_frame, text="複製", width=30, height=24, command=self.copy_sub_item).pack(side="right", padx=2)
 
         # 建立 TabView 用於子表切換
         self.sub_tables_tabs = ctk.CTkTabview(self.frame_right)
@@ -224,6 +236,50 @@ class SheetEditor(ctk.CTkFrame):
                 )
                 btn.pack(fill="x", pady=2)
                 self.cls_buttons[g] = btn
+
+    def move_classification(self, direction):
+        """移動分類順序 (direction: -1=上, +1=下)"""
+        if self.current_cls_val is None:
+            return
+
+        groups = list(self.df[self.cls_key].unique())
+        try:
+            pos = groups.index(self.current_cls_val)
+        except ValueError:
+            return
+
+        new_pos = pos + direction
+        if new_pos < 0 or new_pos >= len(groups):
+            return  # 已在邊界
+
+        # 交換兩組分類在 DataFrame 中的位置
+        groups[pos], groups[new_pos] = groups[new_pos], groups[pos]
+
+        # 按新順序重組 DataFrame
+        parts = []
+        for g in groups:
+            parts.append(self.df[self.df[self.cls_key] == g])
+        self.df = pd.concat(parts, ignore_index=True)
+        self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
+
+        # 重建分類列表（pack 順序改了必須全部重建）
+        for btn in self.cls_buttons.values():
+            btn.destroy()
+        self.cls_buttons.clear()
+        self.load_classification_list()
+
+        # ignore_index=True 後所有 index 重編，必須清空項目按鈕快取 + 重新定位選中項
+        for btn in self.item_buttons.values():
+            btn.destroy()
+        self.item_buttons.clear()
+
+        if self.current_master_pk is not None:
+            matches = self.df[self.df[self.pk_key].astype(str) == str(self.current_master_pk)]
+            self.current_master_idx = matches.index[0] if not matches.empty else None
+
+        if self.current_cls_val is not None:
+            self.load_items_by_group(self.current_cls_val)
 
     def load_items_by_group(self, group_val):
         """載入項目清單 """
@@ -306,6 +362,105 @@ class SheetEditor(ctk.CTkFrame):
 
         # 4. 載入子表
         self.load_sub_tables(self.current_master_pk)
+
+    def move_master_item(self, direction):
+        """移動項目順序 (direction: -1=上, +1=下)，在同分類內移動"""
+        if self.current_master_idx is None or self.current_cls_val is None:
+            return
+
+        # 取得同分類的 rows index list
+        cls_indices = list(self.df[self.df[self.cls_key] == self.current_cls_val].index)
+        try:
+            rel_pos = cls_indices.index(self.current_master_idx)
+        except ValueError:
+            return
+
+        new_rel_pos = rel_pos + direction
+        if new_rel_pos < 0 or new_rel_pos >= len(cls_indices):
+            return  # 已在邊界
+
+        # 取得要交換的兩個絕對 index
+        idx_a = cls_indices[rel_pos]
+        idx_b = cls_indices[new_rel_pos]
+
+        # 交換兩行的值
+        row_a = self.df.iloc[idx_a].copy()
+        row_b = self.df.iloc[idx_b].copy()
+        self.df.iloc[idx_a] = row_b
+        self.df.iloc[idx_b] = row_a
+        self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.dirty = True
+
+        # 更新 current_master_idx 為新位置
+        self.current_master_idx = idx_b
+
+        # 重建項目清單
+        for btn in self.item_buttons.values():
+            btn.destroy()
+        self.item_buttons.clear()
+        self.load_items_by_group(self.current_cls_val)
+        self.load_editor(self.current_master_idx)
+
+    def copy_master_item(self):
+        """複製母表項目（含子表資料）"""
+        if self.current_master_idx is None:
+            messagebox.showwarning("提示", "請先選擇要複製的項目")
+            return
+
+        dialog = ctk.CTkInputDialog(text="請輸入新項目 ID:", title="複製項目")
+        new_id = dialog.get_input()
+        if not new_id:
+            return
+
+        if new_id in self.df[self.pk_key].astype(str).values:
+            messagebox.showerror("錯誤", "此 ID 已存在")
+            return
+
+        # 複製母表行
+        new_row = self.df.loc[self.current_master_idx].copy()
+        old_pk = new_row[self.pk_key]
+        new_row[self.pk_key] = new_id
+
+        # 插入位置：同分類最後一筆之後
+        cls_rows = self.df[self.df[self.cls_key] == self.current_cls_val]
+        insert_idx = cls_rows.index.max() + 1 if not cls_rows.empty else len(self.df)
+
+        top = self.df.iloc[:insert_idx]
+        bottom = self.df.iloc[insert_idx:]
+        self.df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
+        self.manager.master_dfs[self.sheet_name] = self.df
+
+        # 複製子表資料
+        for sub_key, sub_df in list(self.manager.sub_dfs.items()):
+            if not sub_key.startswith(self.sheet_name + "#"):
+                continue
+            short_name = sub_key.split("#")[1]
+            sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
+            fk_key = sub_cfg.get("foreign_key", self.pk_key)
+            if fk_key not in sub_df.columns:
+                continue
+
+            # 篩選屬於舊 PK 的行
+            mask = sub_df[fk_key].astype(str) == str(old_pk)
+            matched = sub_df[mask]
+            if matched.empty:
+                continue
+
+            # 複製並改 FK
+            copied = matched.copy()
+            copied[fk_key] = new_id
+            self.manager.sub_dfs[sub_key] = pd.concat([sub_df, copied], ignore_index=True)
+
+        self.manager.dirty = True
+
+        # 重建項目清單並選中新項目
+        for btn in self.item_buttons.values():
+            btn.destroy()
+        self.item_buttons.clear()
+        self.load_items_by_group(self.current_cls_val)
+
+        new_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
+        self.load_editor(new_idx)
 
     def _build_editor_ui(self, row_data):
         """首次建立編輯器 UI（只執行一次）"""
@@ -525,10 +680,11 @@ class SheetEditor(ctk.CTkFrame):
                 self.img_label.configure(image=ctk_img, text="")
                 self.current_image_ref = ctk_img
             except Exception as e:
-                self.img_label.configure(text="Error", image=None)
+                self.current_image_ref = None
+                self.img_label.configure(text="Error")
         else:
-            self.img_label.configure(text=f"File not found\n{img_file}", image=None)
             self.current_image_ref = None
+            self.img_label.configure(text=f"File not found\n{img_file}")
 
     def _on_field_change(self, col_name, value):
         """欄位變更回調（suppress-flag 模式）"""
@@ -648,6 +804,114 @@ class SheetEditor(ctk.CTkFrame):
         self.current_master_idx = None
         self.load_items_by_group(self.current_cls_val)
         self.load_sub_tables(None)
+
+    def _select_sub_row(self, tab_name, row_frame):
+        """選中子表行（高亮顯示）"""
+        # 取消所有行的高亮
+        for rf in self.sub_table_active_rows.get(tab_name, []):
+            rf.configure(highlightthickness=0)
+
+        # 高亮選中行
+        row_frame.configure(highlightthickness=2, highlightbackground=_CELL_FOCUS_BORDER)
+        self.current_sub_row_idx = row_frame._del_ctx["row_idx"]
+
+    def _highlight_current_sub_row(self, tab_name):
+        """重新高亮當前選中的子表行"""
+        for rf in self.sub_table_active_rows.get(tab_name, []):
+            if rf._del_ctx["row_idx"] == self.current_sub_row_idx:
+                rf.configure(highlightthickness=2, highlightbackground=_CELL_FOCUS_BORDER)
+            else:
+                rf.configure(highlightthickness=0)
+
+    def move_sub_item(self, direction):
+        """移動子表行順序 (direction: -1=上, +1=下)"""
+        if self.current_sub_row_idx is None or self.current_master_pk is None:
+            return
+
+        try:
+            current_tab = self.sub_tables_tabs.get()
+        except:
+            return
+
+        if current_tab == "無子表":
+            return
+
+        full_sub_name = f"{self.sheet_name}#{current_tab}"
+        sub_df = self.manager.sub_dfs.get(full_sub_name)
+        if sub_df is None:
+            return
+
+        sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
+        fk_key = sub_cfg.get("foreign_key", self.pk_key)
+
+        # 取得同母表的 siblings index list
+        mask = sub_df[fk_key].astype(str) == str(self.current_master_pk)
+        siblings_indices = list(sub_df[mask].index)
+
+        try:
+            rel_pos = siblings_indices.index(self.current_sub_row_idx)
+        except ValueError:
+            return
+
+        new_rel_pos = rel_pos + direction
+        if new_rel_pos < 0 or new_rel_pos >= len(siblings_indices):
+            return  # 已在邊界
+
+        idx_a = siblings_indices[rel_pos]
+        idx_b = siblings_indices[new_rel_pos]
+
+        # 交換兩行
+        row_a = sub_df.iloc[idx_a].copy()
+        row_b = sub_df.iloc[idx_b].copy()
+        sub_df.iloc[idx_a] = row_b
+        sub_df.iloc[idx_b] = row_a
+        self.manager.sub_dfs[full_sub_name] = sub_df
+        self.manager.dirty = True
+
+        # 更新選中索引
+        self.current_sub_row_idx = idx_b
+
+        # 刷新子表
+        self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
+        self._highlight_current_sub_row(current_tab)
+
+    def copy_sub_item(self):
+        """複製子表行"""
+        if self.current_sub_row_idx is None or self.current_master_pk is None:
+            return
+
+        try:
+            current_tab = self.sub_tables_tabs.get()
+        except:
+            return
+
+        if current_tab == "無子表":
+            return
+
+        full_sub_name = f"{self.sheet_name}#{current_tab}"
+        sub_df = self.manager.sub_dfs.get(full_sub_name)
+        if sub_df is None or self.current_sub_row_idx not in sub_df.index:
+            return
+
+        sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
+        fk_key = sub_cfg.get("foreign_key", self.pk_key)
+
+        # 複製該行
+        new_row = sub_df.loc[self.current_sub_row_idx].copy()
+
+        # 插入位置：同母表 siblings 的末尾
+        mask = sub_df[fk_key].astype(str) == str(self.current_master_pk)
+        siblings = sub_df[mask]
+        insert_idx = siblings.index.max() + 1 if not siblings.empty else len(sub_df)
+
+        top = sub_df.iloc[:insert_idx]
+        bottom = sub_df.iloc[insert_idx:]
+        sub_df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
+        self.manager.sub_dfs[full_sub_name] = sub_df
+        self.manager.dirty = True
+
+        # 刷新子表
+        self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
 
     def add_sub_item(self):
         """ 新增子表資料（插在該母表最後） """
@@ -1136,6 +1400,20 @@ class SheetEditor(ctk.CTkFrame):
 
                 row_frame._widgets[col] = tw
                 row_frame._vars[col] = None
+
+        # 綁定點擊選中行
+        def _on_row_click(event, rf=row_frame):
+            # 找到當前 tab name
+            try:
+                tab_name = self.sub_tables_tabs.get()
+            except:
+                return
+            self._select_sub_row(tab_name, rf)
+
+        row_frame.bind("<Button-1>", _on_row_click)
+        # 也綁定子 widget（避免點擊子元件時事件不冒泡）
+        for child in row_frame.winfo_children():
+            child.bind("<Button-1>", _on_row_click, add="+")
 
         # 填充初始數據
         self._update_sub_table_row(row_frame, headers, row_data, row_idx, sheet_name, cols_cfg)
