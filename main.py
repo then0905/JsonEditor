@@ -44,7 +44,7 @@ ctk.set_default_color_theme("blue")
 _BG = "#2b2b2b"
 _BG_HEADER = "#404040"
 _ROW_EVEN = "#2b2b2b"
-_ROW_ODD = "#3a3a3a"
+_ROW_ODD = "#323232"
 
 # 子表 tk.Text cell 的暗色主題樣式 (取代沉重的 CTkTextbox)
 _CELL_FONT = ("Segoe UI", 11)
@@ -52,6 +52,31 @@ _CELL_BG = "#343638"
 _CELL_FG = "#DCE4EE"
 _CELL_BORDER = "#565B5E"
 _CELL_FOCUS_BORDER = "#3B8ED0"
+
+# 面板色彩
+_PANEL_HEADER_BG = "#333333"   # 區塊標題底色
+_PANEL_HEADER_FG = "#A0C4E8"   # 區塊標題文字色
+_ACCENT = "#3B8ED0"            # 強調色
+_SEPARATOR = "#444444"         # 分隔線色
+
+# ─── 暗色 ttk Scrollbar 主題 ──────────────────────────────────
+def _init_dark_scrollbar_style():
+    """建立暗色 ttk.Scrollbar style — 只需呼叫一次"""
+    import tkinter.ttk as ttk
+    style = ttk.Style()
+    style.theme_use("default")
+    style.configure("Dark.Vertical.TScrollbar",
+                    background="#555555", troughcolor=_BG,
+                    borderwidth=0, relief="flat", width=10,
+                    arrowsize=10, arrowcolor="#aaaaaa")
+    style.map("Dark.Vertical.TScrollbar",
+              background=[("active", "#777777"), ("!disabled", "#555555")])
+    style.configure("Dark.Horizontal.TScrollbar",
+                    background="#555555", troughcolor=_BG,
+                    borderwidth=0, relief="flat", width=10,
+                    arrowsize=10, arrowcolor="#aaaaaa")
+    style.map("Dark.Horizontal.TScrollbar",
+              background=[("active", "#777777"), ("!disabled", "#555555")])
 
 
 class LightScrollableFrame(tk.Frame):
@@ -61,20 +86,28 @@ class LightScrollableFrame(tk.Frame):
     子元件請放到 .interior 屬性中。
     """
 
+    _INTERIOR_PAD = 6  # 內部左右 padding，避免子元件碰到捲軸
+
     def __init__(self, parent, height=None, **kwargs):
+        import tkinter.ttk as ttk
         super().__init__(parent, bg=_BG)
 
         self._canvas = tk.Canvas(self, bg=_BG, highlightthickness=0, bd=0)
-        self._scrollbar = tk.Scrollbar(self, orient="vertical",
-                                       command=self._canvas.yview)
+        self._scrollbar = ttk.Scrollbar(self, orient="vertical",
+                                        style="Dark.Vertical.TScrollbar",
+                                        command=self._canvas.yview)
         self._scrollbar.pack(side="right", fill="y")
         self._canvas.pack(side="left", fill="both", expand=True)
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
 
-        self.interior = tk.Frame(self._canvas, bg=_BG)
-        self._win_id = self._canvas.create_window((0, 0), window=self.interior, anchor="nw")
+        # _outer 負責提供 padding，interior 給外部放子元件
+        self._outer = tk.Frame(self._canvas, bg=_BG)
+        self.interior = tk.Frame(self._outer, bg=_BG)
+        self.interior.pack(fill="both", expand=True,
+                           padx=self._INTERIOR_PAD, pady=2)
+        self._win_id = self._canvas.create_window((0, 0), window=self._outer, anchor="nw")
 
-        self.interior.bind("<Configure>", self._on_interior_cfg)
+        self._outer.bind("<Configure>", self._on_interior_cfg)
         self._canvas.bind("<Configure>", self._on_canvas_cfg)
 
         if height:
@@ -118,6 +151,11 @@ class SheetEditor(ctk.CTkFrame):
         self.current_sub_row_idx = None  # 子表行選中索引
         self._master_suppress = False  # suppress-flag for master field callbacks
 
+        # 批次編輯模式
+        self._batch_mode = False
+        self._batch_checks = {}  # {row_idx: BooleanVar}
+        self._batch_bar = None  # 批次工具列 widget
+
         # 母表UI緩存
         self.cls_buttons = {}  # {分類值: 按鈕widget}
         self.item_buttons = {}  # {row_idx: 按鈕widget}
@@ -134,6 +172,19 @@ class SheetEditor(ctk.CTkFrame):
         self.setup_layout()
         self.load_classification_list()
 
+    @staticmethod
+    def _make_section_header(parent, text, icon=""):
+        """建立美化的區塊標題列"""
+        hdr = tk.Frame(parent, bg=_PANEL_HEADER_BG, height=32)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        display = f"  {icon}  {text}" if icon else f"  {text}"
+        tk.Label(hdr, text=display, bg=_PANEL_HEADER_BG, fg=_PANEL_HEADER_FG,
+                 font=("微軟正黑體", 11, "bold"), anchor="w").pack(side="left", padx=4, fill="y")
+        # 底部強調線
+        tk.Frame(parent, bg=_ACCENT, height=2).pack(fill="x")
+        return hdr
+
     def setup_layout(self):
         """佈局設置"""
         self.columnconfigure(0, weight=0)
@@ -143,64 +194,70 @@ class SheetEditor(ctk.CTkFrame):
 
         # --- 左側：分類 ---
         self.frame_left = ctk.CTkFrame(self, width=150)
-        self.frame_left.grid(row=0, column=0, sticky="nsew")
+        self.frame_left.grid(row=0, column=0, sticky="nsew", padx=(0, 1))
 
-        ctk.CTkLabel(self.frame_left, text=f"分類: {self.cls_key}", font=("微軟正黑體", 12, "bold")).pack(pady=5)
+        self._make_section_header(self.frame_left, f"分類 ({self.cls_key})", icon="\u25a3")
         self.scroll_cls = LightScrollableFrame(self.frame_left)
-        self.scroll_cls.pack(fill="both", expand=True)
+        self.scroll_cls.pack(fill="both", expand=True, padx=2, pady=2)
 
         # 左側操作按鈕
-        btn_box_left = ctk.CTkFrame(self.frame_left, height=40, fg_color="transparent")
-        btn_box_left.pack(fill="x", pady=5, padx=2)
-        ctk.CTkButton(btn_box_left, text="+", width=40, fg_color="green", command=self.add_classification).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_left, text="-", width=40, fg_color="darkred", command=self.delete_classification).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_left, text="▲", width=30, command=lambda: self.move_classification(-1)).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_left, text="▼", width=30, command=lambda: self.move_classification(1)).pack(side="left", padx=2, expand=True)
+        tk.Frame(self.frame_left, bg=_SEPARATOR, height=1).pack(fill="x", padx=4)
+        btn_box_left = ctk.CTkFrame(self.frame_left, height=36, fg_color="transparent")
+        btn_box_left.pack(fill="x", pady=4, padx=4)
+        ctk.CTkButton(btn_box_left, text="+", width=36, height=28, fg_color="#2d8a4e", hover_color="#236b3c", command=self.add_classification).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_left, text="-", width=36, height=28, fg_color="#8b3a3a", hover_color="#6b2a2a", command=self.delete_classification).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_left, text="\u25b2", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_classification(-1)).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_left, text="\u25bc", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_classification(1)).pack(side="left", padx=1, expand=True)
 
         # --- 中間：項目清單 ---
         self.frame_mid = ctk.CTkFrame(self, width=200)
-        self.frame_mid.grid(row=0, column=1, sticky="nsew")
+        self.frame_mid.grid(row=0, column=1, sticky="nsew", padx=(0, 1))
 
-        ctk.CTkLabel(self.frame_mid, text="清單", font=("微軟正黑體", 12, "bold")).pack(pady=5)
+        self._make_section_header(self.frame_mid, "項目清單", icon="\u2630")
         self.scroll_items = LightScrollableFrame(self.frame_mid)
-        self.scroll_items.pack(fill="both", expand=True)
+        self.scroll_items.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # 中間操作按鈕 — 上排：新增/複製  下排：排序/刪除
+        # 中間操作按鈕
+        tk.Frame(self.frame_mid, bg=_SEPARATOR, height=1).pack(fill="x", padx=4)
         btn_box_mid_top = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
-        btn_box_mid_top.pack(fill="x", pady=(5, 0), padx=2)
-        ctk.CTkButton(btn_box_mid_top, text="新增項目", width=80, fg_color="green", command=self.add_master_item).pack(side="left", padx=2, fill="x", expand=True)
-        ctk.CTkButton(btn_box_mid_top, text="複製", width=60, command=self.copy_master_item).pack(side="right", padx=2)
+        btn_box_mid_top.pack(fill="x", pady=(4, 1), padx=4)
+        ctk.CTkButton(btn_box_mid_top, text="+ 新增", width=70, height=28, fg_color="#2d8a4e", hover_color="#236b3c", command=self.add_master_item).pack(side="left", padx=1, fill="x", expand=True)
+        ctk.CTkButton(btn_box_mid_top, text="複製", width=50, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=self.copy_master_item).pack(side="right", padx=1)
 
         btn_box_mid_bot = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
-        btn_box_mid_bot.pack(fill="x", pady=(2, 5), padx=2)
-        ctk.CTkButton(btn_box_mid_bot, text="▲", width=30, command=lambda: self.move_master_item(-1)).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_mid_bot, text="▼", width=30, command=lambda: self.move_master_item(1)).pack(side="left", padx=2, expand=True)
-        ctk.CTkButton(btn_box_mid_bot, text="刪除", width=60, fg_color="darkred", command=self.delete_master_item).pack(side="right", padx=2)
+        btn_box_mid_bot.pack(fill="x", pady=(1, 4), padx=4)
+        ctk.CTkButton(btn_box_mid_bot, text="\u25b2", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_master_item(-1)).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_mid_bot, text="\u25bc", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_master_item(1)).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_mid_bot, text="批次", width=46, height=28, fg_color="#5a5030", hover_color="#6a6040", command=self._open_batch_edit).pack(side="left", padx=1, expand=True)
+        ctk.CTkButton(btn_box_mid_bot, text="刪除", width=50, height=28, fg_color="#8b3a3a", hover_color="#6b2a2a", command=self.delete_master_item).pack(side="right", padx=1)
 
         # --- 右區：編輯區 (上:母表 / 下:子表) ---
         self.frame_right = ctk.CTkFrame(self)
         self.frame_right.grid(row=0, column=2, sticky="nsew")
 
         # 右上：母表資料
-        ctk.CTkLabel(self.frame_right, text="[母表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
+        self._make_section_header(self.frame_right, "母表資料", icon="\u25c9")
         self.top_container = ctk.CTkFrame(self.frame_right, fg_color="transparent")
-        self.top_container.pack(fill="both", expand=True, padx=5, pady=5)
+        self.top_container.pack(fill="both", expand=True, padx=5, pady=(4, 2))
+
+        # 分隔線
+        tk.Frame(self.frame_right, bg=_SEPARATOR, height=1).pack(fill="x", padx=8, pady=2)
 
         # 右下：子表資料 (標題區含新增按鈕)
-        sub_header_frame = ctk.CTkFrame(self.frame_right, fg_color="transparent")
-        sub_header_frame.pack(fill="x", pady=2, padx=5)
-
-        ctk.CTkLabel(sub_header_frame, text="[子表資料]", font=("微軟正黑體", 12, "bold")).pack(pady=2)
-        # 子表新增按鈕 + 行操作按鈕（與原版同層：label 在上，按鈕在下方 side=right）
-        ctk.CTkButton(sub_header_frame, text="+ 新增子表資料", width=100, height=24, fg_color="green",
-                      command=self.add_sub_item).pack(side="right")
-        ctk.CTkButton(sub_header_frame, text="▼", width=30, height=24, command=lambda: self.move_sub_item(1)).pack(side="right", padx=2)
-        ctk.CTkButton(sub_header_frame, text="▲", width=30, height=24, command=lambda: self.move_sub_item(-1)).pack(side="right", padx=2)
-        ctk.CTkButton(sub_header_frame, text="複製", width=30, height=24, command=self.copy_sub_item).pack(side="right", padx=2)
+        sub_hdr = self._make_section_header(self.frame_right, "子表資料", icon="\u25a6")
+        # 子表操作按鈕嵌入標題列右側
+        ctk.CTkButton(sub_hdr, text="+ 新增", width=56, height=22, fg_color="#2d8a4e", hover_color="#236b3c",
+                      command=self.add_sub_item).pack(side="right", padx=4)
+        ctk.CTkButton(sub_hdr, text="\u25bc", width=26, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
+                      command=lambda: self.move_sub_item(1)).pack(side="right", padx=1)
+        ctk.CTkButton(sub_hdr, text="\u25b2", width=26, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
+                      command=lambda: self.move_sub_item(-1)).pack(side="right", padx=1)
+        ctk.CTkButton(sub_hdr, text="複製", width=36, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
+                      command=self.copy_sub_item).pack(side="right", padx=1)
 
         # 建立 TabView 用於子表切換
         self.sub_tables_tabs = ctk.CTkTabview(self.frame_right)
-        self.sub_tables_tabs.pack(fill="both", expand=True, padx=5, pady=5)
+        self.sub_tables_tabs.pack(fill="both", expand=True, padx=5, pady=(2, 5))
 
     def load_classification_list(self):
         """載入分類列表 """
@@ -234,7 +291,11 @@ class SheetEditor(ctk.CTkFrame):
                     text_color=("black", "white"),
                     command=lambda val=g: self.load_items_by_group(val)
                 )
-                btn.pack(fill="x", pady=2)
+                btn.pack(fill="x", pady=2, padx=2)
+                # 設定內部 label 自動換行
+                if hasattr(btn, '_text_label') and btn._text_label:
+                    btn._text_label.configure(wraplength=110)
+                btn.bind("<Button-3>", lambda e, val=g: self._show_cls_context_menu(e, val))
                 self.cls_buttons[g] = btn
 
     def move_classification(self, direction):
@@ -330,7 +391,10 @@ class SheetEditor(ctk.CTkFrame):
                     fg_color=fg_color,
                     command=lambda i=idx: self.load_editor(i)
                 )
-                btn.pack(fill="x", pady=2)
+                btn.pack(fill="x", pady=2, padx=2)
+                if hasattr(btn, '_text_label') and btn._text_label:
+                    btn._text_label.configure(wraplength=160)
+                btn.bind("<Button-3>", lambda e, i=idx: self._show_item_context_menu(e, i))
                 self.item_buttons[idx] = btn
 
     def load_editor(self, row_idx):
@@ -1037,10 +1101,12 @@ class SheetEditor(ctk.CTkFrame):
         body_frame = tk.Frame(scroll_container, bg=_BG)
         body_frame.pack(fill="both", expand=True)
 
+        import tkinter.ttk as ttk
         canvas = tk.Canvas(body_frame, bg=_BG, highlightthickness=0, bd=0)
 
-        v_scrollbar = tk.Scrollbar(body_frame, orient="vertical",
-                                   command=canvas.yview)
+        v_scrollbar = ttk.Scrollbar(body_frame, orient="vertical",
+                                    style="Dark.Vertical.TScrollbar",
+                                    command=canvas.yview)
         v_scrollbar.pack(side="right", fill="y")
 
         # 水平捲軸同步驅動 data canvas 和 header canvas
@@ -1048,8 +1114,9 @@ class SheetEditor(ctk.CTkFrame):
             canvas.xview(*args)
             header_canvas.xview(*args)
 
-        h_scrollbar = tk.Scrollbar(body_frame, orient="horizontal",
-                                   command=xview_sync)
+        h_scrollbar = ttk.Scrollbar(body_frame, orient="horizontal",
+                                    style="Dark.Horizontal.TScrollbar",
+                                    command=xview_sync)
         h_scrollbar.pack(side="bottom", fill="x")
 
         canvas.pack(side="left", fill="both", expand=True)
@@ -1415,6 +1482,33 @@ class SheetEditor(ctk.CTkFrame):
         for child in row_frame.winfo_children():
             child.bind("<Button-1>", _on_row_click, add="+")
 
+        # 綁定雙擊跳轉引用（FK 欄位及其他可能的引用欄位）
+        for col in headers:
+            widget = row_frame._widgets.get(col)
+            if widget is None:
+                continue
+            # 取得實際可綁定的 widget
+            target_w = widget[0] if isinstance(widget, tuple) else widget
+            target_w.bind("<Double-Button-1>",
+                          lambda e, c=col, rf=row_frame: self._on_ref_double_click(c, rf))
+            # 如果是 tuple (key_entry, textbox)，也綁定 textbox
+            if isinstance(widget, tuple):
+                widget[1].bind("<Double-Button-1>",
+                               lambda e, c=col, rf=row_frame: self._on_ref_double_click(c, rf))
+
+        # 綁定右鍵選單
+        def _on_row_right_click(event, rf=row_frame, sn=sheet_name):
+            try:
+                tab_name = self.sub_tables_tabs.get()
+            except:
+                return
+            self._select_sub_row(tab_name, rf)
+            self._show_sub_row_context_menu(event, rf, sn)
+
+        row_frame.bind("<Button-3>", _on_row_right_click)
+        for child in row_frame.winfo_children():
+            child.bind("<Button-3>", _on_row_right_click, add="+")
+
         # 填充初始數據
         self._update_sub_table_row(row_frame, headers, row_data, row_idx, sheet_name, cols_cfg)
 
@@ -1498,6 +1592,218 @@ class SheetEditor(ctk.CTkFrame):
 
         # 顯示錯誤 — 原生 tk.Label
         tk.Label(data_frame, text=message, bg=_BG, fg="red", font=_CELL_FONT).pack(pady=20)
+
+    # ================== 跨表引用跳轉 ==================
+
+    def _on_ref_double_click(self, col, row_frame):
+        """雙擊子表欄位 → 查找是否為其他母表的 PK 並跳轉"""
+        ctx = row_frame._ctxs.get(col)
+        if not ctx:
+            return
+
+        # 取得當前 cell 的值
+        widget = row_frame._widgets.get(col)
+        if widget is None:
+            return
+        if isinstance(widget, tuple):
+            # linked field: key_entry 的值
+            key_entry = widget[0]
+            key_entry.configure(state="normal")
+            value = key_entry.get().strip()
+            key_entry.configure(state="disabled")
+        elif hasattr(widget, 'get') and callable(widget.get):
+            if isinstance(widget, tk.Text):
+                value = widget.get("1.0", "end-1c").strip()
+            else:
+                value = widget.get().strip()
+        else:
+            var = row_frame._vars.get(col)
+            value = str(var.get()).strip() if var else ""
+
+        if not value:
+            return
+
+        # 查找哪個母表的 PK 包含此值
+        for sheet_name, df in self.manager.master_dfs.items():
+            cfg = self.manager.config.get(sheet_name, {})
+            pk_key = cfg.get("primary_key", df.columns[0])
+            if pk_key in df.columns:
+                matches = df[df[pk_key].astype(str) == str(value)]
+                if not matches.empty:
+                    app = self.winfo_toplevel()
+                    if hasattr(app, '_jump_to_master'):
+                        app._jump_to_master(sheet_name, value)
+                    return
+
+    # ================== 右鍵選單 ==================
+
+    def _show_item_context_menu(self, event, row_idx):
+        """中間項目清單右鍵選單"""
+        self.load_editor(row_idx)
+        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
+                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
+                       font=_CELL_FONT)
+        menu.add_command(label="複製項目", command=self.copy_master_item)
+        menu.add_command(label="上移 \u25b2", command=lambda: self.move_master_item(-1))
+        menu.add_command(label="下移 \u25bc", command=lambda: self.move_master_item(1))
+        menu.add_separator()
+        menu.add_command(label="刪除", command=self.delete_master_item)
+        menu.post(event.x_root, event.y_root)
+
+    def _show_sub_row_context_menu(self, event, row_frame, sheet_name):
+        """子表行右鍵選單"""
+        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
+                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
+                       font=_CELL_FONT)
+        menu.add_command(label="複製行", command=self.copy_sub_item)
+        menu.add_command(label="上移 \u25b2", command=lambda: self.move_sub_item(-1))
+        menu.add_command(label="下移 \u25bc", command=lambda: self.move_sub_item(1))
+        menu.add_separator()
+
+        # 跳轉引用：讀取 FK 值
+        del_ctx = row_frame._del_ctx
+        sub_short = sheet_name.split("#")[1] if "#" in sheet_name else ""
+        sub_cfg = self.cfg.get("sub_sheets", {}).get(sub_short, {})
+        fk_key = sub_cfg.get("foreign_key", self.pk_key)
+        # 嘗試取得 FK 欄位以外的可跳轉值
+        def _try_jump_ref():
+            for col, ctx in row_frame._ctxs.items():
+                widget = row_frame._widgets.get(col)
+                if widget is None:
+                    continue
+                if isinstance(widget, tuple):
+                    key_entry = widget[0]
+                    key_entry.configure(state="normal")
+                    val = key_entry.get().strip()
+                    key_entry.configure(state="disabled")
+                elif isinstance(widget, tk.Text):
+                    val = widget.get("1.0", "end-1c").strip()
+                elif hasattr(widget, 'get') and callable(widget.get):
+                    val = widget.get().strip()
+                else:
+                    var = row_frame._vars.get(col)
+                    val = str(var.get()).strip() if var else ""
+                if val:
+                    self._on_ref_double_click(col, row_frame)
+                    return
+
+        menu.add_command(label="跳轉引用", command=_try_jump_ref)
+        menu.add_separator()
+        menu.add_command(label="刪除",
+                         command=lambda: self.delete_sub_item(del_ctx["sheet"], del_ctx["row_idx"]))
+        menu.post(event.x_root, event.y_root)
+
+    def _show_cls_context_menu(self, event, cls_val):
+        """左側分類右鍵選單"""
+        self.load_items_by_group(cls_val)
+        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
+                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
+                       font=_CELL_FONT)
+        menu.add_command(label="上移 \u25b2", command=lambda: self.move_classification(-1))
+        menu.add_command(label="下移 \u25bc", command=lambda: self.move_classification(1))
+        menu.add_separator()
+        menu.add_command(label="刪除", command=self.delete_classification)
+        menu.post(event.x_root, event.y_root)
+
+    def _open_batch_edit(self):
+        """切換批次編輯模式"""
+        if self._batch_mode:
+            self._exit_batch_mode()
+            return
+
+        if not self.current_cls_val:
+            messagebox.showwarning("提示", "請先選擇一個分類")
+            return
+
+        self._batch_mode = True
+        self._batch_checks.clear()
+
+        # 顯示批次工具列
+        if self._batch_bar:
+            self._batch_bar.destroy()
+        bar = ctk.CTkFrame(self.frame_mid, height=30, fg_color="#2a4a6b")
+        bar.pack(fill="x", padx=2, pady=(0, 2), before=self.scroll_items)
+        self._batch_bar = bar
+
+        ctk.CTkButton(bar, text="全選", width=45, height=24,
+                      command=self._batch_select_all).pack(side="left", padx=2)
+        ctk.CTkButton(bar, text="取消全選", width=60, height=24,
+                      command=self._batch_deselect_all).pack(side="left", padx=2)
+        ctk.CTkButton(bar, text="修改欄位", width=60, height=24, fg_color="green",
+                      command=self._batch_apply_dialog).pack(side="left", padx=2)
+        ctk.CTkButton(bar, text="完成", width=45, height=24, fg_color="gray",
+                      command=self._exit_batch_mode).pack(side="right", padx=2)
+
+        # 重建項目清單（帶勾選框）
+        for btn in self.item_buttons.values():
+            btn.destroy()
+        self.item_buttons.clear()
+        self._rebuild_items_with_checks()
+
+    def _exit_batch_mode(self):
+        """退出批次編輯模式"""
+        self._batch_mode = False
+        self._batch_checks.clear()
+        if self._batch_bar:
+            self._batch_bar.destroy()
+            self._batch_bar = None
+
+        # 重建正常項目清單
+        for btn in self.item_buttons.values():
+            btn.destroy()
+        self.item_buttons.clear()
+        if self.current_cls_val is not None:
+            self.load_items_by_group(self.current_cls_val)
+
+    def _rebuild_items_with_checks(self):
+        """在批次模式下重建帶勾選框的項目清單"""
+        if not self.current_cls_val:
+            return
+        filter_df = self.df[self.df[self.cls_key] == self.current_cls_val]
+
+        for idx, row in filter_df.iterrows():
+            display_name = f"{row[self.pk_key]}"
+            if 'Name' in row.index and self.manager.text_dict:
+                text_dict_name = self.manager.text_dict.get(row['Name'])
+                if text_dict_name:
+                    display_name = text_dict_name["value"]
+
+            rf = tk.Frame(self.scroll_items.interior, bg=_BG)
+            rf.pack(fill="x", pady=1, padx=2)
+
+            var = tk.BooleanVar(value=False)
+            self._batch_checks[idx] = var
+
+            chk = tk.Checkbutton(rf, variable=var, bg=_BG,
+                                 activebackground=_BG, selectcolor=_CELL_BG)
+            chk.pack(side="left", padx=(2, 0))
+
+            lbl = tk.Label(rf, text=display_name, bg=_BG, fg=_CELL_FG,
+                           font=_CELL_FONT, anchor="w", cursor="hand2",
+                           wraplength=140)
+            lbl.pack(side="left", fill="x", expand=True, padx=4)
+
+            # 點擊 label 也切換勾選
+            lbl.bind("<Button-1>", lambda e, v=var: v.set(not v.get()))
+
+            self.item_buttons[idx] = rf
+
+    def _batch_select_all(self):
+        for var in self._batch_checks.values():
+            var.set(True)
+
+    def _batch_deselect_all(self):
+        for var in self._batch_checks.values():
+            var.set(False)
+
+    def _batch_apply_dialog(self):
+        """彈出欄位+值選擇視窗，套用到所有勾選項"""
+        selected = [idx for idx, var in self._batch_checks.items() if var.get()]
+        if not selected:
+            messagebox.showwarning("提示", "請先勾選至少一個項目")
+            return
+
+        BatchEditApplyWindow(self, selected)
 
     def cleanup(self):
         """清理資源"""
@@ -1912,6 +2218,169 @@ class ConfigEditorWindow(ctk.CTkToplevel):
         if hasattr(self.master, "refresh_ui"):
             self.master.refresh_ui()
 
+class SearchResultWindow(ctk.CTkToplevel):
+    """全域搜尋結果視窗（非模態，美化版）"""
+
+    _TAG_MASTER_BG = "#1a5c2a"  # 母表標籤底色（綠）
+    _TAG_SUB_BG = "#8b6914"     # 子表標籤底色（金）
+    _TAG_FG = "#ffffff"
+    _HOVER_BG = "#3a5070"       # 滑鼠懸停底色
+    _MATCH_FG = "#7ec8e3"       # 匹配值高亮色
+
+    def __init__(self, parent, results, jump_callback, query=""):
+        super().__init__(parent)
+        self.title("搜尋結果")
+        self.geometry("750x520")
+        self.transient(parent)
+
+        self._jump_callback = jump_callback
+
+        # ── 頂部標題列 ──
+        header = ctk.CTkFrame(self, fg_color="#333333", corner_radius=0)
+        header.pack(fill="x")
+        ctk.CTkLabel(header, text=f"  找到 {len(results)} 筆結果",
+                     font=("微軟正黑體", 14, "bold"),
+                     text_color="#7ec8e3").pack(side="left", padx=10, pady=8)
+        if query:
+            ctk.CTkLabel(header, text=f"關鍵字: {query}",
+                         font=("微軟正黑體", 11),
+                         text_color="#aaaaaa").pack(side="left", padx=10)
+        ctk.CTkButton(header, text="關閉", width=50, height=26,
+                      fg_color="gray", command=self.destroy).pack(side="right", padx=10, pady=6)
+
+        # ── 結果列表（CTkScrollableFrame — 一次性建立，非迴圈熱路徑） ──
+        scroll = ctk.CTkScrollableFrame(self, fg_color=_BG)
+        scroll.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        for i, (sheet_name, is_sub, row_idx, match_info) in enumerate(results):
+            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
+
+            rf = tk.Frame(scroll, bg=row_bg, cursor="hand2",
+                          highlightthickness=1, highlightbackground="#444444")
+            rf.pack(fill="x", pady=2, padx=4, ipady=3)
+
+            # 標籤 (母表/子表)
+            if is_sub:
+                tag_text, tag_bg = "子表", self._TAG_SUB_BG
+            else:
+                tag_text, tag_bg = "母表", self._TAG_MASTER_BG
+
+            tag_lbl = tk.Label(rf, text=f" {tag_text} ", bg=tag_bg, fg=self._TAG_FG,
+                               font=("微軟正黑體", 9, "bold"), padx=4, pady=1)
+            tag_lbl.pack(side="left", padx=(6, 4), pady=2)
+
+            # 表名
+            sheet_display = sheet_name.replace("#", " > ") if "#" in sheet_name else sheet_name
+            tk.Label(rf, text=sheet_display, bg=row_bg, fg="#b0b0b0",
+                     font=("微軟正黑體", 10), anchor="w").pack(side="left", padx=(0, 8))
+
+            # 匹配內容（最多 2 組 col=val）
+            match_strs = []
+            for col, val in list(match_info.items())[:2]:
+                display_val = val if len(val) <= 40 else val[:37] + "..."
+                match_strs.append(f"{col}={display_val}")
+
+            tk.Label(rf, text="  |  ".join(match_strs), bg=row_bg,
+                     fg=self._MATCH_FG, font=_CELL_FONT, anchor="w").pack(
+                side="left", fill="x", expand=True, padx=4)
+
+            # 行號
+            tk.Label(rf, text=f"#{row_idx}", bg=row_bg, fg="#777777",
+                     font=("Segoe UI", 9)).pack(side="right", padx=(4, 8))
+
+            # hover 效果 + 點擊
+            def _enter(e, f=rf):
+                f.configure(bg=self._HOVER_BG)
+                for w in f.winfo_children():
+                    try:
+                        w.configure(bg=self._HOVER_BG)
+                    except tk.TclError:
+                        pass
+
+            def _leave(e, f=rf, bg=row_bg):
+                f.configure(bg=bg)
+                for w in f.winfo_children():
+                    try:
+                        # tag label 保持原色
+                        if getattr(w, '_is_tag', False):
+                            pass
+                        else:
+                            w.configure(bg=bg)
+                    except tk.TclError:
+                        pass
+
+            def _on_click(e, s=sheet_name, sub=is_sub, idx=row_idx):
+                self._jump_callback(s, sub, idx)
+
+            tag_lbl._is_tag = True  # 標記不被 hover 改色
+
+            for w in [rf] + rf.winfo_children():
+                w.bind("<Enter>", _enter)
+                w.bind("<Leave>", _leave)
+                w.bind("<Button-1>", _on_click)
+
+
+class BatchEditApplyWindow(ctk.CTkToplevel):
+    """批次編輯 — 選擇欄位與新值（勾選模式觸發）"""
+    def __init__(self, parent_editor, selected_indices):
+        super().__init__(parent_editor.winfo_toplevel())
+        self.title("批次修改")
+        self.geometry("400x180")
+        self.transient(parent_editor.winfo_toplevel())
+        self.grab_set()
+
+        self.editor = parent_editor
+        self.selected = selected_indices
+
+        ctk.CTkLabel(self, text=f"將修改 {len(selected_indices)} 筆項目",
+                     font=("微軟正黑體", 13, "bold")).pack(pady=(10, 5))
+
+        # 目標欄位
+        field_frame = ctk.CTkFrame(self, fg_color="transparent")
+        field_frame.pack(fill="x", padx=20, pady=5)
+        ctk.CTkLabel(field_frame, text="目標欄位:").pack(side="left")
+        cols = list(parent_editor.df.columns)
+        self.col_var = ctk.StringVar(value=cols[0] if cols else "")
+        ctk.CTkOptionMenu(field_frame, values=cols, variable=self.col_var).pack(
+            side="left", padx=10, fill="x", expand=True)
+
+        # 新的值
+        val_frame = ctk.CTkFrame(self, fg_color="transparent")
+        val_frame.pack(fill="x", padx=20, pady=5)
+        ctk.CTkLabel(val_frame, text="新的值:").pack(side="left")
+        self.val_entry = ctk.CTkEntry(val_frame)
+        self.val_entry.pack(side="left", padx=10, fill="x", expand=True)
+        self.val_entry.bind("<Return>", lambda e: self._apply())
+
+        # 按鈕
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="套用", fg_color="green",
+                      command=self._apply).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="取消", fg_color="gray",
+                      command=self.destroy).pack(side="left", padx=10)
+
+    def _apply(self):
+        col = self.col_var.get()
+        value = self.val_entry.get()
+        if not col:
+            return
+
+        editor = self.editor
+        manager = editor.manager
+
+        for idx in self.selected:
+            manager.update_cell(False, editor.sheet_name, idx, col, value)
+        manager.dirty = True
+
+        self.destroy()
+
+        # 退出批次模式並刷新
+        editor._exit_batch_mode()
+        if editor.current_master_idx is not None:
+            editor.load_editor(editor.current_master_idx)
+
+
 class App(ctk.CTk):
     """ 主畫面 """
     def __init__(self):
@@ -1931,13 +2400,39 @@ class App(ctk.CTk):
 
         self.manager = DataManager()
 
+        # 初始化暗色捲軸主題
+        _init_dark_scrollbar_style()
+
         # 頂部操作列
         self.top_bar = ctk.CTkFrame(self, height=40)
         self.top_bar.pack(fill="x", padx=5, pady=5)
 
         ctk.CTkButton(self.top_bar, text="讀取 Excel", command=self.load_file).pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="儲存 Excel", command=self.save_file, fg_color="green").pack(side="left", padx=5)
+        ctk.CTkButton(self.top_bar, text="搜尋", width=60, command=self._show_search_bar).pack(side="left", padx=5)
         ctk.CTkButton(self.top_bar, text="配置設定", command=self.open_configwnd, fg_color="gray").pack(side="right", padx=5)
+
+        # === 搜尋列 (Ctrl+F) ===
+        self.search_bar = ctk.CTkFrame(self, height=38, fg_color="#1e3a52",
+                                       border_width=1, border_color="#3B8ED0")
+        self._search_visible = False
+
+        sf = self.search_bar
+        ctk.CTkLabel(sf, text="  \U0001f50d", font=("Segoe UI", 13)).pack(side="left", padx=(6, 2))
+        self._search_var = ctk.StringVar()
+        self._search_entry = ctk.CTkEntry(sf, textvariable=self._search_var, width=320,
+                                          height=28, placeholder_text="輸入關鍵字搜尋所有表...")
+        self._search_entry.pack(side="left", padx=4)
+        self._search_entry.bind("<Return>", lambda e: self._perform_search())
+        ctk.CTkButton(sf, text="搜尋", width=60, height=28,
+                      command=self._perform_search).pack(side="left", padx=4)
+        ctk.CTkButton(sf, text="\u2715", width=28, height=28, fg_color="#555555",
+                      hover_color="#777777", command=self._hide_search_bar).pack(side="left", padx=2)
+        ctk.CTkLabel(sf, text="Ctrl+F", font=("Segoe UI", 9),
+                     text_color="#666666").pack(side="right", padx=10)
+
+        self.bind_all("<Control-f>", lambda e: self._show_search_bar())
+        self._search_entry.bind("<Escape>", lambda e: self._hide_search_bar())
 
         # 內容區 (Tabview 存放不同的母表)
         self.main_tabs = ctk.CTkTabview(self, command=self._on_main_tab_changed)
@@ -2086,6 +2581,150 @@ class App(ctk.CTk):
             messagebox.showinfo("提示", "請先匯入Excel後再進行參數的配置")
             return
         _ = ConfigEditorWindow(self, self.manager)
+
+    # ================== 搜尋功能 ==================
+
+    def _show_search_bar(self):
+        if not self._search_visible:
+            self.search_bar.pack(after=self.top_bar, fill="x", padx=5, pady=(0, 2))
+            self._search_visible = True
+        self._search_entry.focus_set()
+        self._search_entry.select_range(0, "end")
+
+    def _hide_search_bar(self):
+        if self._search_visible:
+            self.search_bar.pack_forget()
+            self._search_visible = False
+        self._search_var.set("")
+
+    def _perform_search(self):
+        query = self._search_var.get().strip()
+        if not query:
+            return
+
+        results = []
+        limit = 200
+
+        # 搜尋母表
+        for sheet_name, df in self.manager.master_dfs.items():
+            if len(results) >= limit:
+                break
+            try:
+                mask = df.astype(str).apply(
+                    lambda col: col.str.contains(query, case=False, na=False))
+                matched = mask.any(axis=1)
+                for idx in df[matched].index:
+                    if len(results) >= limit:
+                        break
+                    matched_cols = {col: str(df.at[idx, col])
+                                    for col in df.columns if mask.at[idx, col]}
+                    results.append((sheet_name, False, idx, matched_cols))
+            except Exception:
+                pass
+
+        # 搜尋子表
+        for sub_name, sub_df in self.manager.sub_dfs.items():
+            if len(results) >= limit:
+                break
+            try:
+                mask = sub_df.astype(str).apply(
+                    lambda col: col.str.contains(query, case=False, na=False))
+                matched = mask.any(axis=1)
+                for idx in sub_df[matched].index:
+                    if len(results) >= limit:
+                        break
+                    matched_cols = {col: str(sub_df.at[idx, col])
+                                    for col in sub_df.columns if mask.at[idx, col]}
+                    results.append((sub_name, True, idx, matched_cols))
+            except Exception:
+                pass
+
+        # 搜尋連結文字
+        if self.manager.text_dict and len(results) < limit:
+            for key, info in self.manager.text_dict.items():
+                if len(results) >= limit:
+                    break
+                val = info["value"] if isinstance(info, dict) else str(info)
+                if query.lower() in val.lower() or query.lower() in str(key).lower():
+                    # 找到哪個母表行引用此 key
+                    for sheet_name, df in self.manager.master_dfs.items():
+                        for col in df.columns:
+                            col_mask = df[col].astype(str) == str(key)
+                            for idx in df[col_mask].index:
+                                if len(results) >= limit:
+                                    break
+                                results.append((sheet_name, False, idx,
+                                                {col: str(key), "Text": val}))
+
+        if not results:
+            messagebox.showinfo("搜尋", f"找不到「{query}」")
+            return
+
+        SearchResultWindow(self, results, self._jump_to_result, query=query)
+
+    def _jump_to_result(self, sheet_name, is_sub, row_idx):
+        """跳轉到搜尋結果"""
+        if is_sub:
+            # 子表結果：取得母表名 + FK 值 → 跳轉母表
+            parts = sheet_name.split("#")
+            master_sheet = parts[0]
+            sub_short = parts[1] if len(parts) > 1 else ""
+
+            sub_df = self.manager.sub_dfs.get(sheet_name)
+            if sub_df is None or row_idx not in sub_df.index:
+                return
+
+            # 找 FK
+            cfg = self.manager.config.get(master_sheet, {})
+            sub_cfg = cfg.get("sub_sheets", {}).get(sub_short, {})
+            pk_key = cfg.get("primary_key", "")
+            fk_key = sub_cfg.get("foreign_key", pk_key)
+
+            if fk_key in sub_df.columns:
+                fk_val = str(sub_df.at[row_idx, fk_key])
+                self._jump_to_master(master_sheet, fk_val)
+        else:
+            # 母表結果：直接跳轉
+            if sheet_name not in self.manager.master_dfs:
+                return
+            df = self.manager.master_dfs[sheet_name]
+            if row_idx not in df.index:
+                return
+
+            # 切換 tab
+            self.main_tabs.set(sheet_name)
+            self._ensure_editor(sheet_name)
+            editor = self._editor_map.get(sheet_name)
+            if not editor:
+                return
+
+            # 找到該行的分類
+            cls_val = df.at[row_idx, editor.cls_key]
+            editor.load_items_by_group(cls_val)
+            editor.load_editor(row_idx)
+
+    def _jump_to_master(self, sheet_name, pk_value):
+        """跳轉到指定母表的指定 PK 項目"""
+        if sheet_name not in self.manager.master_dfs:
+            return
+
+        df = self.manager.master_dfs[sheet_name]
+        self.main_tabs.set(sheet_name)
+        self._ensure_editor(sheet_name)
+        editor = self._editor_map.get(sheet_name)
+        if not editor:
+            return
+
+        # 找到 PK 對應的行
+        matches = df[df[editor.pk_key].astype(str) == str(pk_value)]
+        if matches.empty:
+            messagebox.showinfo("跳轉", f"找不到 {pk_value}")
+            return
+
+        row_idx = matches.index[0]
+        cls_val = df.at[row_idx, editor.cls_key]
+        editor.load_items_by_group(cls_val)
+        editor.load_editor(row_idx)
 
     def _route_mousewheel(self, event):
         """將滑鼠滾輪事件路由到游標所在的可捲動區域"""
