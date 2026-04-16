@@ -1,2780 +1,1684 @@
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import messagebox, filedialog
-from data_manager import DataManager
-import os
+#!/usr/bin/env python3
+"""JsonEditor — PySide6 rewrite"""
+
 import sys
-import threading
-from PIL import Image
+import os
+
 import pandas as pd
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QSplitter, QTabWidget,
+    QListWidget, QListWidgetItem, QLineEdit, QPushButton, QLabel,
+    QVBoxLayout, QHBoxLayout, QScrollArea, QCheckBox, QComboBox,
+    QTextEdit, QToolBar, QTableView, QHeaderView, QAbstractItemView,
+    QStackedWidget, QFileDialog, QMenu, QSizePolicy, QFrame,
+    QInputDialog, QMessageBox, QGridLayout, QStyledItemDelegate,
+    QApplication,
+)
+from PySide6.QtCore import (
+    Qt, Signal, QAbstractTableModel, QModelIndex,
+    QTimer, QSize, QThread,
+)
+from PySide6.QtGui import QAction, QColor, QKeySequence, QFont, QBrush
 
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
-
-# ══════════════════════════════════════════════════════════════
-# Performance Guidelines（效能開發守則）
-# ══════════════════════════════════════════════════════════════
-# 1. 禁止在迴圈/熱路徑使用 CTk 元件（CTkEntry, CTkOptionMenu, CTkCheckBox,
-#    CTkLabel, CTkButton, CTkTextbox）。一律用原生 tk/ttk 並手動套暗色主題。
-#    CTk 元件僅可用於「一次性建立且不在迴圈中」的框架層級（如 CTkTabview）。
-#
-# 2. 回呼綁定使用 suppress-flag 模式：callback 內部讀取 mutable context dict
-#    （_ctx["suppress"]），注入資料時 suppress=True 即可跳過，不需 unbind/rebind。
-#
-# 3. Tab 內容一律 lazy-load：只在 tab 被選中時才建立/更新 UI。
-#    使用 _ensure_editor / _on_tab_changed 模式。
-#
-# 4. 批次 UI 更新使用 freeze/thaw 模式：凍結期間阻擋 _update_widths 等
-#    佈局回呼，全部完成後一次 flush。
-#
-# 5. DataFrame 運算限定在 data_manager.py，UI 層不做 pandas 操作。
-#    大量資料讀取/寫入必須在背景線程 + loading dialog。
-#
-# 6. 查找操作使用 dict/set O(1)，禁止在迴圈內線性掃描。
-#    （例：text_dict, row_index）
-#
-# 7. 跳過 no-op：configure/resize 前先比對舊值（_last_lines, _prev_width），
-#    相同則不呼叫。
-#
-# 8. 新功能上線前用生產級資料量（14+ sheets, 1000+ rows）測試，
-#    確認無 UI 凍結（>200ms 主線程阻塞）。
-# ══════════════════════════════════════════════════════════════
-
-# Dark theme 色彩常數
-_BG = "#2b2b2b"
-_BG_HEADER = "#404040"
-_ROW_EVEN = "#2b2b2b"
-_ROW_ODD = "#323232"
-
-# 子表 tk.Text cell 的暗色主題樣式 (取代沉重的 CTkTextbox)
-_CELL_FONT = ("Segoe UI", 11)
-_CELL_BG = "#343638"
-_CELL_FG = "#DCE4EE"
-_CELL_BORDER = "#565B5E"
-_CELL_FOCUS_BORDER = "#3B8ED0"
-
-# 面板色彩
-_PANEL_HEADER_BG = "#333333"   # 區塊標題底色
-_PANEL_HEADER_FG = "#A0C4E8"   # 區塊標題文字色
-_ACCENT = "#3B8ED0"            # 強調色
-_SEPARATOR = "#444444"         # 分隔線色
-
-# ─── 暗色 ttk Scrollbar 主題 ──────────────────────────────────
-def _init_dark_scrollbar_style():
-    """建立暗色 ttk.Scrollbar style — 只需呼叫一次"""
-    import tkinter.ttk as ttk
-    style = ttk.Style()
-    style.theme_use("default")
-    style.configure("Dark.Vertical.TScrollbar",
-                    background="#555555", troughcolor=_BG,
-                    borderwidth=0, relief="flat", width=10,
-                    arrowsize=10, arrowcolor="#aaaaaa")
-    style.map("Dark.Vertical.TScrollbar",
-              background=[("active", "#777777"), ("!disabled", "#555555")])
-    style.configure("Dark.Horizontal.TScrollbar",
-                    background="#555555", troughcolor=_BG,
-                    borderwidth=0, relief="flat", width=10,
-                    arrowsize=10, arrowcolor="#aaaaaa")
-    style.map("Dark.Horizontal.TScrollbar",
-              background=[("active", "#777777"), ("!disabled", "#555555")])
+from json_data_manager import JsonDataManager
 
 
-class LightScrollableFrame(tk.Frame):
-    """
-    輕量化可捲動框架 — 替代 ctk.CTkScrollableFrame。
-    內部全部使用原生 tk 元件，避免 CTk 雙層 canvas 在快速捲動時產生殘影。
-    子元件請放到 .interior 屬性中。
-    """
+# ── Background workers ────────────────────────────────────────────────────────
 
-    _INTERIOR_PAD = 6  # 內部左右 padding，避免子元件碰到捲軸
+class _LoadWorker(QThread):
+    done  = Signal()
+    error = Signal(str)
 
-    def __init__(self, parent, height=None, **kwargs):
-        import tkinter.ttk as ttk
-        super().__init__(parent, bg=_BG)
+    def __init__(self, manager, path):
+        super().__init__()
+        self._manager = manager
+        self._path    = path
 
-        self._canvas = tk.Canvas(self, bg=_BG, highlightthickness=0, bd=0)
-        self._scrollbar = ttk.Scrollbar(self, orient="vertical",
-                                        style="Dark.Vertical.TScrollbar",
-                                        command=self._canvas.yview)
-        self._scrollbar.pack(side="right", fill="y")
-        self._canvas.pack(side="left", fill="both", expand=True)
-        self._canvas.configure(yscrollcommand=self._scrollbar.set)
-
-        # _outer 負責提供 padding，interior 給外部放子元件
-        self._outer = tk.Frame(self._canvas, bg=_BG)
-        self.interior = tk.Frame(self._outer, bg=_BG)
-        self.interior.pack(fill="both", expand=True,
-                           padx=self._INTERIOR_PAD, pady=2)
-        self._win_id = self._canvas.create_window((0, 0), window=self._outer, anchor="nw")
-
-        self._outer.bind("<Configure>", self._on_interior_cfg)
-        self._canvas.bind("<Configure>", self._on_canvas_cfg)
-
-        if height:
-            self._canvas.configure(height=height)
-
-        # 供 App 層級滾輪路由識別
-        self._canvas._is_light_scrollable = True
-
-    def _update_scroll_region(self):
-        bbox = self._canvas.bbox("all")
-        if bbox:
-            canvas_h = self._canvas.winfo_height()
-            region_h = max(bbox[3], canvas_h)
-            self._canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], region_h))
-
-    def _on_interior_cfg(self, _event=None):
-        self._update_scroll_region()
-
-    def _on_canvas_cfg(self, event):
-        self._canvas.itemconfig(self._win_id, width=event.width)
-        self._update_scroll_region()
+    def run(self):
+        try:
+            self._manager.load_json(self._path)
+            self.done.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 
-class SheetEditor(ctk.CTkFrame):
-    """ 單一母表的編輯介面 (包含左中右佈局) """
-    def __init__(self, parent, sheet_name, manager):
+class _SaveWorker(QThread):
+    done  = Signal()
+    error = Signal(str)
+
+    def __init__(self, manager):
+        super().__init__()
+        self._manager = manager
+
+    def run(self):
+        try:
+            self._manager.save_json()
+            self.done.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── Stylesheet ────────────────────────────────────────────────────────────────
+APP_STYLE = """
+* { font-family: "Segoe UI"; font-size: 11px; color: #dce4ee; }
+QMainWindow, QWidget#root { background: #2b2b2b; }
+QSplitter::handle:horizontal { background: #3a3a4a; width: 3px; }
+QSplitter::handle:vertical   { background: #3a3a4a; height: 3px; }
+
+/* Tabs */
+QTabWidget::pane { border: 1px solid #3a3a4a; background: #2b2b2b; }
+QTabBar::tab            { background: #1e1e2e; color: #888899; padding: 5px 16px; border: none; }
+QTabBar::tab:selected   { background: #3B8ED0; color: white; }
+QTabBar::tab:hover:!selected { background: #2a2a42; color: #dce4ee; }
+
+/* Lists */
+QListWidget { background: #252535; border: none; outline: none; }
+QListWidget::item { padding: 5px 8px; }
+QListWidget::item:selected          { background: #3B8ED0; color: white; }
+QListWidget::item:hover:!selected   { background: #3a3a52; }
+
+/* Line / Text edits */
+QLineEdit {
+    background: #343638; border: 1px solid #565B5E;
+    padding: 3px 6px; border-radius: 2px;
+    selection-background-color: #3B8ED0;
+}
+QLineEdit:focus { border-color: #3B8ED0; }
+QLineEdit[invalid="true"] { border-color: #e05050; background: #3a1a1a; }
+QTextEdit {
+    background: #343638; border: 1px solid #565B5E;
+    selection-background-color: #3B8ED0;
+}
+QTextEdit:focus { border-color: #3B8ED0; }
+
+/* ComboBox */
+QComboBox {
+    background: #343638; border: 1px solid #565B5E;
+    padding: 2px 6px; border-radius: 2px;
+}
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView {
+    background: #343638; border: 1px solid #565B5E;
+    selection-background-color: #3B8ED0;
+}
+
+/* CheckBox */
+QCheckBox::indicator {
+    width: 14px; height: 14px;
+    border: 1px solid #565B5E; background: #343638; border-radius: 2px;
+}
+QCheckBox::indicator:checked { background: #3B8ED0; border-color: #3B8ED0; }
+
+/* Buttons */
+QPushButton {
+    background: #3a3a52; border: none; padding: 4px 12px; border-radius: 2px;
+}
+QPushButton:hover   { background: #4a4a62; }
+QPushButton:pressed { background: #2a2a42; }
+QPushButton[accent="add"]        { background: #2d8a4e; }
+QPushButton[accent="add"]:hover  { background: #3aaa5e; }
+QPushButton[accent="del"]        { background: #8b3a3a; }
+QPushButton[accent="del"]:hover  { background: #aa4a4a; }
+QPushButton[accent="blue"]       { background: #3B8ED0; }
+QPushButton[accent="blue"]:hover { background: #2a6ea0; }
+
+/* Table */
+QTableView {
+    background: #2b2b2b; gridline-color: #3a3a4a;
+    border: none; outline: none;
+    selection-background-color: #3B8ED0;
+}
+QTableView::item:hover:!selected { background: #323246; }
+QHeaderView::section {
+    background: #404040; padding: 4px 6px;
+    border: 1px solid #3a3a4a; font-weight: bold;
+}
+QHeaderView::section:hover   { background: #505060; }
+QHeaderView::section:pressed { background: #3B8ED0; color: white; }
+
+/* Scrollbars */
+QScrollBar:vertical   { background: #2b2b2b; width: 10px; border: none; }
+QScrollBar:horizontal { background: #2b2b2b; height: 10px; border: none; }
+QScrollBar::handle:vertical   { background: #555; min-height: 24px; border-radius: 4px; margin: 1px; }
+QScrollBar::handle:horizontal { background: #555; min-width:  24px; border-radius: 4px; margin: 1px; }
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #777; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+
+/* Toolbar */
+QToolBar {
+    background: #1e1e2e; border: none;
+    border-bottom: 1px solid #3a3a52; spacing: 2px; padding: 4px 6px;
+}
+QToolBar QToolButton { background: transparent; border: none; padding: 6px 10px; border-radius: 3px; }
+QToolBar QToolButton:hover   { background: #2e2e42; }
+QToolBar QToolButton:pressed { background: #3B8ED0; }
+QToolBar::separator { background: #3a3a52; width: 1px; margin: 6px 4px; }
+
+/* Status bar */
+QStatusBar { background: #13131e; border-top: 1px solid #3a3a52; }
+QStatusBar::item { border: none; }
+
+/* Menus */
+QMenu { background: #252535; border: 1px solid #3a3a52; padding: 4px; }
+QMenu::item { padding: 5px 20px; }
+QMenu::item:selected { background: #3B8ED0; color: white; }
+QMenu::separator { height: 1px; background: #3a3a52; margin: 3px 8px; }
+
+/* Panels */
+QFrame#panel { background: #252535; }
+QLabel#section-hdr {
+    background: #2a2a3a; color: #A0C4E8; font-weight: bold;
+    padding: 5px 8px; border-bottom: 1px solid #3a3a4a;
+}
+"""
+
+_DIRTY_BG  = "#2a2a10"
+_ROW_EVEN  = QColor("#2b2b2b")
+_ROW_ODD   = QColor("#323232")
+_ACCENT    = QColor("#3B8ED0")
+
+
+def _accent_btn(text, kind="add"):
+    b = QPushButton(text)
+    b.setProperty("accent", kind)
+    return b
+
+
+def _sep_frame():
+    f = QFrame()
+    f.setFrameShape(QFrame.HLine)
+    f.setStyleSheet("background: #3a3a4a; max-height: 1px;")
+    return f
+
+
+def _section_label(text):
+    lbl = QLabel(text)
+    lbl.setObjectName("section-hdr")
+    lbl.setFixedHeight(30)
+    return lbl
+
+
+# ── SubTableModel ─────────────────────────────────────────────────────────────
+
+class SubTableModel(QAbstractTableModel):
+    def __init__(self, df, cols_cfg, manager, sheet_full_name):
+        super().__init__()
+        self._df = df if df is not None else pd.DataFrame()
+        self._cols_cfg = cols_cfg or {}
+        self._manager = manager
+        self._sheet = sheet_full_name
+
+    # ── Qt interface ──────────────────────────────────────────────────────────
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._df)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._df.columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        r, c = index.row(), index.column()
+        col = self._df.columns[c]
+        col_type = self._cols_cfg.get(col, {}).get("type", "string")
+        val = self._df.iat[r, c]
+        row_idx = self._df.index[r]
+
+        if role == Qt.DisplayRole:
+            return None if col_type == "bool" else (str(val) if val is not None else "")
+
+        if role == Qt.CheckStateRole and col_type == "bool":
+            v = val
+            if isinstance(v, str):
+                v = v.lower() in ("true", "1", "yes")
+            return Qt.Checked if v else Qt.Unchecked
+
+        if role == Qt.BackgroundRole:
+            if (self._sheet, row_idx, col) in self._manager.dirty_cells:
+                return QBrush(QColor(_DIRTY_BG))
+            return QBrush(_ROW_EVEN if r % 2 == 0 else _ROW_ODD)
+
+        if role == Qt.ForegroundRole:
+            return QBrush(QColor("#dce4ee"))
+
+        return None
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid():
+            return False
+        r, c = index.row(), index.column()
+        col = self._df.columns[c]
+        row_idx = self._df.index[r]
+        if role == Qt.CheckStateRole:
+            value = (value == Qt.Checked)
+        self._manager.update_cell(self._sheet, row_idx, col, value)
+        # Refresh df reference
+        self._df = self._manager.sub_tables.get(self._sheet, self._df)
+        self.dataChanged.emit(index, index)
+        return True
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        col = self._df.columns[index.column()]
+        col_type = self._cols_cfg.get(col, {}).get("type", "string")
+        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if col_type == "bool":
+            return base | Qt.ItemIsUserCheckable
+        return base | Qt.ItemIsEditable
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return str(self._df.columns[section])
+        return str(section + 1)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def reload(self, df, cols_cfg=None):
+        self.beginResetModel()
+        self._df = df if df is not None else pd.DataFrame()
+        if cols_cfg is not None:
+            self._cols_cfg = cols_cfg
+        self.endResetModel()
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        """In-place sort so QTableView header clicks work without a proxy model."""
+        if column < 0 or column >= len(self._df.columns):
+            return
+        col_name = self._df.columns[column]
+        self.layoutAboutToBeChanged.emit()
+        try:
+            self._df = self._df.sort_values(
+                col_name, ascending=(order == Qt.AscendingOrder), kind="mergesort"
+            )
+        except Exception:
+            pass
+        self.layoutChanged.emit()
+
+    def df_index(self, view_row):
+        if 0 <= view_row < len(self._df):
+            return self._df.index[view_row]
+        return None
+
+    @property
+    def df(self):
+        return self._df
+
+
+# ── EnumDelegate ──────────────────────────────────────────────────────────────
+
+class EnumDelegate(QStyledItemDelegate):
+    def __init__(self, options, parent=None):
         super().__init__(parent)
-        self.sheet_name = sheet_name
-        self.manager = manager
-        self.df = manager.master_dfs[sheet_name]
-        self.cfg = manager.config.get(sheet_name, {})
-
-        # 取得關鍵欄位
-        self.cls_key = self.cfg.get("classification_key", self.df.columns[0])
-        self.pk_key = self.cfg.get("primary_key", self.df.columns[0])
-
-        self.current_cls_val = None
-        self.current_master_idx = None
-        self.current_master_pk = None
-        self.current_image_ref = None
-        self.current_sub_row_idx = None  # 子表行選中索引
-        self._master_suppress = False  # suppress-flag for master field callbacks
-
-        # 批次編輯模式
-        self._batch_mode = False
-        self._batch_checks = {}  # {row_idx: BooleanVar}
-        self._batch_bar = None  # 批次工具列 widget
-
-        # 母表UI緩存
-        self.cls_buttons = {}  # {分類值: 按鈕widget}
-        self.item_buttons = {}  # {row_idx: 按鈕widget}
-        self.master_fields = {}  # {欄位名: Entry/CheckBox等widget}
-        self.master_field_vars = {}  # {欄位名: StringVar/BooleanVar}
-        self.trace_ids = {}  # {欄位名: trace_id} 用於清理舊的 trace
-
-        # 子表UI緩存
-        self.sub_table_frames = {}  # {tab_name: 容器frame}
-        self.sub_table_headers = {}  # {tab_name: 標題frame}
-        self.sub_table_row_pools = {}  # {tab_name: [可重用的row_frame列表]}
-        self.sub_table_active_rows = {}  # {tab_name: [正在使用的row_frame列表]}
-
-        self.setup_layout()
-        self.load_classification_list()
-
-    @staticmethod
-    def _make_section_header(parent, text, icon=""):
-        """建立美化的區塊標題列"""
-        hdr = tk.Frame(parent, bg=_PANEL_HEADER_BG, height=32)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        display = f"  {icon}  {text}" if icon else f"  {text}"
-        tk.Label(hdr, text=display, bg=_PANEL_HEADER_BG, fg=_PANEL_HEADER_FG,
-                 font=("微軟正黑體", 11, "bold"), anchor="w").pack(side="left", padx=4, fill="y")
-        # 底部強調線
-        tk.Frame(parent, bg=_ACCENT, height=2).pack(fill="x")
-        return hdr
-
-    def setup_layout(self):
-        """佈局設置"""
-        self.columnconfigure(0, weight=0)
-        self.columnconfigure(1, weight=0)
-        self.columnconfigure(2, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        # --- 左側：分類 ---
-        self.frame_left = ctk.CTkFrame(self, width=150)
-        self.frame_left.grid(row=0, column=0, sticky="nsew", padx=(0, 1))
-
-        self._make_section_header(self.frame_left, f"分類 ({self.cls_key})", icon="\u25a3")
-        self.scroll_cls = LightScrollableFrame(self.frame_left)
-        self.scroll_cls.pack(fill="both", expand=True, padx=2, pady=2)
-
-        # 左側操作按鈕
-        tk.Frame(self.frame_left, bg=_SEPARATOR, height=1).pack(fill="x", padx=4)
-        btn_box_left = ctk.CTkFrame(self.frame_left, height=36, fg_color="transparent")
-        btn_box_left.pack(fill="x", pady=4, padx=4)
-        ctk.CTkButton(btn_box_left, text="+", width=36, height=28, fg_color="#2d8a4e", hover_color="#236b3c", command=self.add_classification).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_left, text="-", width=36, height=28, fg_color="#8b3a3a", hover_color="#6b2a2a", command=self.delete_classification).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_left, text="\u25b2", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_classification(-1)).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_left, text="\u25bc", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_classification(1)).pack(side="left", padx=1, expand=True)
-
-        # --- 中間：項目清單 ---
-        self.frame_mid = ctk.CTkFrame(self, width=200)
-        self.frame_mid.grid(row=0, column=1, sticky="nsew", padx=(0, 1))
-
-        self._make_section_header(self.frame_mid, "項目清單", icon="\u2630")
-        self.scroll_items = LightScrollableFrame(self.frame_mid)
-        self.scroll_items.pack(fill="both", expand=True, padx=2, pady=2)
-
-        # 中間操作按鈕
-        tk.Frame(self.frame_mid, bg=_SEPARATOR, height=1).pack(fill="x", padx=4)
-        btn_box_mid_top = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
-        btn_box_mid_top.pack(fill="x", pady=(4, 1), padx=4)
-        ctk.CTkButton(btn_box_mid_top, text="+ 新增", width=70, height=28, fg_color="#2d8a4e", hover_color="#236b3c", command=self.add_master_item).pack(side="left", padx=1, fill="x", expand=True)
-        ctk.CTkButton(btn_box_mid_top, text="複製", width=50, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=self.copy_master_item).pack(side="right", padx=1)
-
-        btn_box_mid_bot = ctk.CTkFrame(self.frame_mid, height=30, fg_color="transparent")
-        btn_box_mid_bot.pack(fill="x", pady=(1, 4), padx=4)
-        ctk.CTkButton(btn_box_mid_bot, text="\u25b2", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_master_item(-1)).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_mid_bot, text="\u25bc", width=30, height=28, fg_color="#4a4a4a", hover_color="#5a5a5a", command=lambda: self.move_master_item(1)).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_mid_bot, text="批次", width=46, height=28, fg_color="#5a5030", hover_color="#6a6040", command=self._open_batch_edit).pack(side="left", padx=1, expand=True)
-        ctk.CTkButton(btn_box_mid_bot, text="刪除", width=50, height=28, fg_color="#8b3a3a", hover_color="#6b2a2a", command=self.delete_master_item).pack(side="right", padx=1)
-
-        # --- 右區：編輯區 (上:母表 / 下:子表) ---
-        self.frame_right = ctk.CTkFrame(self)
-        self.frame_right.grid(row=0, column=2, sticky="nsew")
-
-        # 右上：母表資料
-        self._make_section_header(self.frame_right, "母表資料", icon="\u25c9")
-        self.top_container = ctk.CTkFrame(self.frame_right, fg_color="transparent")
-        self.top_container.pack(fill="both", expand=True, padx=5, pady=(4, 2))
-
-        # 分隔線
-        tk.Frame(self.frame_right, bg=_SEPARATOR, height=1).pack(fill="x", padx=8, pady=2)
-
-        # 右下：子表資料 (標題區含新增按鈕)
-        sub_hdr = self._make_section_header(self.frame_right, "子表資料", icon="\u25a6")
-        # 子表操作按鈕嵌入標題列右側
-        ctk.CTkButton(sub_hdr, text="+ 新增", width=56, height=22, fg_color="#2d8a4e", hover_color="#236b3c",
-                      command=self.add_sub_item).pack(side="right", padx=4)
-        ctk.CTkButton(sub_hdr, text="\u25bc", width=26, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
-                      command=lambda: self.move_sub_item(1)).pack(side="right", padx=1)
-        ctk.CTkButton(sub_hdr, text="\u25b2", width=26, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
-                      command=lambda: self.move_sub_item(-1)).pack(side="right", padx=1)
-        ctk.CTkButton(sub_hdr, text="複製", width=36, height=22, fg_color="#4a4a4a", hover_color="#5a5a5a",
-                      command=self.copy_sub_item).pack(side="right", padx=1)
-
-        # 建立 TabView 用於子表切換
-        self.sub_tables_tabs = ctk.CTkTabview(self.frame_right)
-        self.sub_tables_tabs.pack(fill="both", expand=True, padx=5, pady=(2, 5))
-
-    def load_classification_list(self):
-        """載入分類列表 """
-        groups = self.df[self.cls_key].unique()
-        current_groups = set(groups)
-        cached_groups = set(self.cls_buttons.keys())
-
-        # 1. 移除已不存在的分類按鈕
-        for group in (cached_groups - current_groups):
-            if group in self.cls_buttons:
-                self.cls_buttons[group].destroy()
-                del self.cls_buttons[group]
-
-        # 2. 新增或更新分類按鈕
-        for g in groups:
-            if g in self.cls_buttons:
-                # 已存在：只更新顏色（高亮狀態）
-                btn = self.cls_buttons[g]
-                if str(g) == str(self.current_cls_val):
-                    btn.configure(fg_color=("#3B8ED0", "#1F6AA5"))
-                else:
-                    btn.configure(fg_color="transparent")
-            else:
-                # 不存在：創建新按鈕
-                fg_color = ("#3B8ED0", "#1F6AA5") if str(g) == str(self.current_cls_val) else "transparent"
-                btn = ctk.CTkButton(
-                    self.scroll_cls.interior,
-                    text=str(g),
-                    fg_color=fg_color,
-                    border_width=1,
-                    text_color=("black", "white"),
-                    command=lambda val=g: self.load_items_by_group(val)
-                )
-                btn.pack(fill="x", pady=2, padx=2)
-                # 設定內部 label 自動換行
-                if hasattr(btn, '_text_label') and btn._text_label:
-                    btn._text_label.configure(wraplength=110)
-                btn.bind("<Button-3>", lambda e, val=g: self._show_cls_context_menu(e, val))
-                self.cls_buttons[g] = btn
-
-    def move_classification(self, direction):
-        """移動分類順序 (direction: -1=上, +1=下)"""
-        if self.current_cls_val is None:
-            return
-
-        groups = list(self.df[self.cls_key].unique())
-        try:
-            pos = groups.index(self.current_cls_val)
-        except ValueError:
-            return
-
-        new_pos = pos + direction
-        if new_pos < 0 or new_pos >= len(groups):
-            return  # 已在邊界
-
-        # 交換兩組分類在 DataFrame 中的位置
-        groups[pos], groups[new_pos] = groups[new_pos], groups[pos]
-
-        # 按新順序重組 DataFrame
-        parts = []
-        for g in groups:
-            parts.append(self.df[self.df[self.cls_key] == g])
-        self.df = pd.concat(parts, ignore_index=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
-        self.manager.dirty = True
-
-        # 重建分類列表（pack 順序改了必須全部重建）
-        for btn in self.cls_buttons.values():
-            btn.destroy()
-        self.cls_buttons.clear()
-        self.load_classification_list()
-
-        # ignore_index=True 後所有 index 重編，必須清空項目按鈕快取 + 重新定位選中項
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
-
-        if self.current_master_pk is not None:
-            matches = self.df[self.df[self.pk_key].astype(str) == str(self.current_master_pk)]
-            self.current_master_idx = matches.index[0] if not matches.empty else None
-
-        if self.current_cls_val is not None:
-            self.load_items_by_group(self.current_cls_val)
-
-    def load_items_by_group(self, group_val):
-        """載入項目清單 """
-        self.current_cls_val = group_val
-
-        # 更新左側分類按鈕的高亮狀態（不重建）
-        for g, btn in self.cls_buttons.items():
-            if str(g) == str(group_val):
-                btn.configure(fg_color=("#3B8ED0", "#1F6AA5"))
-            else:
-                btn.configure(fg_color="transparent")
-
-        # 篩選該分類的資料
-        filter_df = self.df[self.df[self.cls_key] == group_val]
-        current_indices = set(filter_df.index)
-        cached_indices = set(self.item_buttons.keys())
-
-        # 1. 移除已不存在的項目按鈕
-        for idx in (cached_indices - current_indices):
-            if idx in self.item_buttons:
-                self.item_buttons[idx].destroy()
-                del self.item_buttons[idx]
-
-        # 2. 新增或更新項目按鈕
-        for idx, row in filter_df.iterrows():
-            # 取得顯示名稱
-            display_name = f"{row[self.pk_key]}"
-            if 'Name' in row.index and self.manager.text_dict:
-                text_dict_name = self.manager.text_dict.get(row['Name'])
-                if text_dict_name:
-                    display_name = text_dict_name["value"]
-
-            if idx in self.item_buttons:
-                # 已存在：只更新文字和顏色
-                btn = self.item_buttons[idx]
-                btn.configure(text=display_name)
-                if idx == self.current_master_idx:
-                    btn.configure(fg_color=("#3B8ED0", "#1F6AA5"))
-                else:
-                    btn.configure(fg_color="gray")
-            else:
-                # 不存在：創建新按鈕
-                fg_color = ("#3B8ED0", "#1F6AA5") if idx == self.current_master_idx else "gray"
-                btn = ctk.CTkButton(
-                    self.scroll_items.interior,
-                    text=display_name,
-                    anchor="w",
-                    fg_color=fg_color,
-                    command=lambda i=idx: self.load_editor(i)
-                )
-                btn.pack(fill="x", pady=2, padx=2)
-                if hasattr(btn, '_text_label') and btn._text_label:
-                    btn._text_label.configure(wraplength=160)
-                btn.bind("<Button-3>", lambda e, i=idx: self._show_item_context_menu(e, i))
-                self.item_buttons[idx] = btn
-
-    def load_editor(self, row_idx):
-        """載入編輯器 """
-        self.current_master_idx = row_idx
-
-        # 1. 更新中間清單的高亮（不重建）
-        for idx, btn in self.item_buttons.items():
-            if idx == row_idx:
-                btn.configure(fg_color=("#3B8ED0", "#1F6AA5"))
-            else:
-                btn.configure(fg_color="gray")
-
-        if row_idx not in self.df.index:
-            return
-
-        row_data = self.df.loc[row_idx]
-        self.current_master_pk = row_data[self.pk_key]
-
-        # 2. 如果是第一次載入，建立 UI 結構
-        if not self.master_fields:
-            self._build_editor_ui(row_data)
-        else:
-            # 已有 UI，只更新數據
-            self._update_editor_data(row_data)
-
-        # 3. 更新圖片（如果有）
-        self._update_image()
-
-        # 4. 載入子表
-        self.load_sub_tables(self.current_master_pk)
-
-    def move_master_item(self, direction):
-        """移動項目順序 (direction: -1=上, +1=下)，在同分類內移動"""
-        if self.current_master_idx is None or self.current_cls_val is None:
-            return
-
-        # 取得同分類的 rows index list
-        cls_indices = list(self.df[self.df[self.cls_key] == self.current_cls_val].index)
-        try:
-            rel_pos = cls_indices.index(self.current_master_idx)
-        except ValueError:
-            return
-
-        new_rel_pos = rel_pos + direction
-        if new_rel_pos < 0 or new_rel_pos >= len(cls_indices):
-            return  # 已在邊界
-
-        # 取得要交換的兩個絕對 index
-        idx_a = cls_indices[rel_pos]
-        idx_b = cls_indices[new_rel_pos]
-
-        # 交換兩行的值
-        row_a = self.df.iloc[idx_a].copy()
-        row_b = self.df.iloc[idx_b].copy()
-        self.df.iloc[idx_a] = row_b
-        self.df.iloc[idx_b] = row_a
-        self.manager.master_dfs[self.sheet_name] = self.df
-        self.manager.dirty = True
-
-        # 更新 current_master_idx 為新位置
-        self.current_master_idx = idx_b
-
-        # 重建項目清單
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
-        self.load_items_by_group(self.current_cls_val)
-        self.load_editor(self.current_master_idx)
-
-    def copy_master_item(self):
-        """複製母表項目（含子表資料）"""
-        if self.current_master_idx is None:
-            messagebox.showwarning("提示", "請先選擇要複製的項目")
-            return
-
-        dialog = ctk.CTkInputDialog(text="請輸入新項目 ID:", title="複製項目")
-        new_id = dialog.get_input()
-        if not new_id:
-            return
-
-        if new_id in self.df[self.pk_key].astype(str).values:
-            messagebox.showerror("錯誤", "此 ID 已存在")
-            return
-
-        # 複製母表行
-        new_row = self.df.loc[self.current_master_idx].copy()
-        old_pk = new_row[self.pk_key]
-        new_row[self.pk_key] = new_id
-
-        # 插入位置：同分類最後一筆之後
-        cls_rows = self.df[self.df[self.cls_key] == self.current_cls_val]
-        insert_idx = cls_rows.index.max() + 1 if not cls_rows.empty else len(self.df)
-
-        top = self.df.iloc[:insert_idx]
-        bottom = self.df.iloc[insert_idx:]
-        self.df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
-
-        # 複製子表資料
-        for sub_key, sub_df in list(self.manager.sub_dfs.items()):
-            if not sub_key.startswith(self.sheet_name + "#"):
-                continue
-            short_name = sub_key.split("#")[1]
-            sub_cfg = self.cfg.get("sub_sheets", {}).get(short_name, {})
-            fk_key = sub_cfg.get("foreign_key", self.pk_key)
-            if fk_key not in sub_df.columns:
-                continue
-
-            # 篩選屬於舊 PK 的行
-            mask = sub_df[fk_key].astype(str) == str(old_pk)
-            matched = sub_df[mask]
-            if matched.empty:
-                continue
-
-            # 複製並改 FK
-            copied = matched.copy()
-            copied[fk_key] = new_id
-            self.manager.sub_dfs[sub_key] = pd.concat([sub_df, copied], ignore_index=True)
-
-        self.manager.dirty = True
-
-        # 重建項目清單並選中新項目
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
-        self.load_items_by_group(self.current_cls_val)
-
-        new_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
-        self.load_editor(new_idx)
-
-    def _build_editor_ui(self, row_data):
-        """首次建立編輯器 UI（只執行一次）"""
-        # 清空容器
-        for w in self.top_container.winfo_children():
-            w.destroy()
-
-        use_icon = self.cfg.get("use_icon", False)
-        img_base_path = self.cfg.get("image_path", "")
-
-        # 建立圖片框架（如果需要）
-        if use_icon:
-            self.img_frame = ctk.CTkFrame(self.top_container, width=150, height=100)
-            self.img_frame.pack(side="left", fill="y", padx=(0, 5))
-            self.img_frame.pack_propagate(False)
-
-            self.img_label = ctk.CTkLabel(self.img_frame, text="No Image")
-            self.img_label.pack(expand=True)
-
-            edit_target_frame = LightScrollableFrame(self.top_container, height=100)
-            edit_target_frame.pack(side="right", fill="both", expand=True)
-        else:
-            self.img_frame = None
-            self.img_label = None
-            edit_target_frame = LightScrollableFrame(self.top_container, height=100)
-            edit_target_frame.pack(fill="both", expand=True)
-
-        # 建立欄位 UI
-        cols_cfg = self.cfg.get("columns", {})
-        self.master_fields = {}
-        self.master_field_vars = {}
-        self.trace_ids = {}
-
-        for col in self.df.columns:
-            f = tk.Frame(edit_target_frame.interior, bg=_BG)
-            f.pack(fill="x", pady=2)
-
-            ctk.CTkLabel(f, text=col, width=100, anchor="w").pack(side="left")
-
+        self._options = [str(o) for o in options]
+
+    def createEditor(self, parent, option, index):
+        cb = QComboBox(parent)
+        cb.addItems(self._options)
+        return cb
+
+    def setEditorData(self, editor, index):
+        val = index.data(Qt.DisplayRole) or ""
+        idx = editor.findText(val)
+        if idx >= 0:
+            editor.setCurrentIndex(idx)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText(), Qt.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
+# ── FieldEditorWidget ─────────────────────────────────────────────────────────
+
+class FieldEditorWidget(QWidget):
+    """Build-once field form; load_row() updates values only."""
+    field_changed = Signal(str, object)  # col, value
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._widgets = {}       # col → QWidget
+        self._col_types = {}     # col → type str
+        self._base_styles = {}   # col → base stylesheet
+        self._row_idx = None
+        self._table_name = None
+        self._manager = None
+        self._built = False
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self._content = QWidget()
+        self._grid = QGridLayout(self._content)
+        self._grid.setColumnMinimumWidth(0, 140)
+        self._grid.setColumnStretch(1, 1)
+        self._grid.setContentsMargins(6, 6, 10, 6)
+        self._grid.setVerticalSpacing(2)
+        self._grid.setHorizontalSpacing(8)
+        scroll.setWidget(self._content)
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.addWidget(scroll)
+
+    def build_for(self, df, cfg, table_name, manager):
+        # Destroy old widgets
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._widgets.clear()
+        self._col_types.clear()
+        self._base_styles.clear()
+        self._table_name = table_name
+        self._manager = manager
+
+        cols_cfg = cfg.get("columns", {})
+
+        for i, col in enumerate(df.columns):
             col_conf = cols_cfg.get(col, {})
             col_type = col_conf.get("type", "string")
-            is_linked = col_conf.get("link_to_text", False)
+            self._col_types[col] = col_type
 
-            if is_linked:
-                # Key (唯讀)
-                key_entry = ctk.CTkEntry(f, width=80, text_color="gray")
-                key_entry.configure(state="disabled")
-                key_entry.pack(side="left", padx=(0, 5))
+            row_color = "#2b2b2b" if i % 2 == 0 else "#323232"
 
-                # Text (可編輯) — 原生 tk.Text（輕量，取代 CTkTextbox）
-                textbox = self._make_master_text_cell(f)
-                textbox.pack(side="left", fill="x", expand=True)
+            lbl = QLabel(col)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setStyleSheet(
+                f"color:#A0C4E8; font-weight:bold; background:{row_color};"
+                f"padding:5px 4px; border-radius:2px;"
+            )
+            self._grid.addWidget(lbl, i, 0)
 
-                self.master_fields[col] = (key_entry, textbox)
-                self.master_field_vars[col] = None
+            base = f"background:{row_color};"
 
-                textbox.bind("<KeyRelease>",
-                             lambda e, c=col, tb=textbox: (self._on_linked_field_change_tb(c, tb), self._resize_text_cell(tb)))
-                self.trace_ids[col] = "bind"
-
-            elif col_type == "bool":
-                var = ctk.BooleanVar()
-                chk = ctk.CTkCheckBox(f, text="", variable=var,
-                                      command=lambda c=col, v=var: self._on_field_change(c, v.get()))
-                chk.pack(side="left")
-
-                self.master_fields[col] = chk
-                self.master_field_vars[col] = var
+            if col_type == "bool":
+                w = QCheckBox()
+                w.setStyleSheet(f"background:{row_color}; padding:5px;")
+                w.checkStateChanged.connect(lambda s, c=col:
+                    self.field_changed.emit(c, s == Qt.Checked))
 
             elif col_type == "enum":
-                opts = col_conf.get("options", [])
-                menu = ctk.CTkOptionMenu(f, values=opts,
-                                         command=lambda v, c=col: self._on_field_change(c, v))
-                menu.pack(side="left", fill="x", expand=True)
-
-                self.master_fields[col] = menu
+                opts = col_conf.get("options") or [""]
+                w = QComboBox()
+                w.addItems([str(o) for o in opts])
+                w.setStyleSheet(base)
+                w.currentTextChanged.connect(lambda v, c=col:
+                    self.field_changed.emit(c, v))
 
             elif col_type in ("int", "float"):
-                var = ctk.StringVar()
-                entry = ctk.CTkEntry(f, textvariable=var)
-                entry.pack(side="left", fill="x", expand=True)
+                w = QLineEdit()
+                w.setStyleSheet(base)
+                w.textChanged.connect(lambda v, c=col, ct=col_type:
+                    self._on_numeric(c, v, ct))
 
-                self.master_fields[col] = entry
-                self.master_field_vars[col] = var
+            else:  # string → QTextEdit
+                w = QTextEdit()
+                w.setMaximumHeight(72)
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                w.setStyleSheet(base)
+                w.textChanged.connect(lambda c=col, widget=w:
+                    self.field_changed.emit(c, widget.toPlainText()))
 
-                trace_id = var.trace_add("write",
-                                         lambda *args, c=col, v=var: self._on_field_change(c, v.get()))
-                self.trace_ids[col] = trace_id
+            self._base_styles[col] = base
+            self._grid.addWidget(w, i, 1)
+            self._widgets[col] = w
 
-            else:  # string — 原生 tk.Text（輕量，取代 CTkTextbox）
-                textbox = self._make_master_text_cell(f)
-                textbox.pack(side="left", fill="x", expand=True)
+        self._grid.setRowStretch(len(df.columns), 1)
+        self._built = True
 
-                self.master_fields[col] = textbox
-                self.master_field_vars[col] = None
+    # ── Validation ────────────────────────────────────────────────────────────
 
-                textbox.bind("<KeyRelease>",
-                             lambda e, c=col, tb=textbox: (self._on_field_change(c, tb.get("1.0", "end-1c")), self._resize_text_cell(tb)))
-                self.trace_ids[col] = "bind"
+    def _on_numeric(self, col, value, col_type):
+        w = self._widgets.get(col)
+        if w:
+            valid = self._validate(value, col_type)
+            w.setProperty("invalid", "true" if not valid else "false")
+            w.style().unpolish(w)
+            w.style().polish(w)
+        self.field_changed.emit(col, value)
 
-        # 首次載入數據
-        self._update_editor_data(row_data)
+    @staticmethod
+    def _validate(value, col_type):
+        if col_type == "int":
+            return value == "" or value.lstrip("-").isdigit()
+        if col_type == "float":
+            if value in ("", "-", "."): return True
+            try: float(value); return True
+            except ValueError: return False
+        return True
 
-    def _on_linked_field_change_tb(self, col, textbox):
-        """連結欄位 (tk.Text 版) 文字變更回呼
-        讀取快取的 _linked_key，避免每次按鍵觸發 2 次 CTkEntry.configure"""
-        if getattr(self, '_master_suppress', False):
+    # ── Load row ──────────────────────────────────────────────────────────────
+
+    def load_row(self, row_data, row_idx):
+        if not self._built:
             return
-        key = getattr(textbox, '_linked_key', None)
-        if key is None:
-            return
-        new_text = textbox.get("1.0", "end-1c")
-        self.manager.update_linked_text(key, new_text)
+        self._row_idx = row_idx
+        dirty = self._manager.dirty_cells if self._manager else set()
 
-    def _update_editor_data(self, row_data):
-        """只更新欄位的數據值（不重建 UI）
-        使用 suppress-flag 模式：suppress=True 時 callback 直接跳過，
-        無需 unbind/rebind 開銷。"""
-        cols_cfg = self.cfg.get("columns", {})
-        _deferred_resize = []  # 收集需要調整高度的 textbox，延遲一起執行
+        for col, w in self._widgets.items():
+            w.blockSignals(True)
+            try:
+                try:
+                    val = row_data[col]
+                except (KeyError, TypeError):
+                    val = ""
 
-        # suppress all master field callbacks
-        self._master_suppress = True
+                col_type = self._col_types[col]
+                is_dirty = (self._table_name, row_idx, col) in dirty
+                base = self._base_styles.get(col, "")
+                dirty_extra = f"background:{_DIRTY_BG};" if is_dirty else ""
+                combined = base + dirty_extra
 
-        try:
-            for col in self.df.columns:
-                if col not in self.master_fields:
-                    continue
-
-                val = row_data[col]
-                col_conf = cols_cfg.get(col, {})
-                col_type = col_conf.get("type", "string")
-                is_linked = col_conf.get("link_to_text", False)
-
-                if is_linked:
-                    key_entry, textbox = self.master_fields[col]
-
-                    # 更新 Key
-                    key_entry.configure(state="normal")
-                    key_entry.delete(0, "end")
-                    key_entry.insert(0, str(val))
-                    key_entry.configure(state="disabled")
-
-                    # 快取 linked key 到 textbox 上（供 _on_linked_field_change_tb 讀取）
-                    textbox._linked_key = str(val)
-
-                    # 更新 Text (tk.Text)
-                    real_text = str(self.manager.get_text_value(val))
-                    textbox.delete("1.0", "end")
-                    textbox.insert("1.0", real_text)
-                    _deferred_resize.append(textbox)
-
-                elif col_type == "bool":
-                    var = self.master_field_vars[col]
-                    var.set(bool(val))
+                if col_type == "bool":
+                    v = val
+                    if isinstance(v, str):
+                        v = v.lower() in ("true", "1", "yes")
+                    w.setChecked(bool(v) if val != "" else False)
+                    w.setStyleSheet(combined)
 
                 elif col_type == "enum":
-                    menu = self.master_fields[col]
-                    menu.set(str(val))
+                    w.setCurrentText(str(val) if val is not None else "")
+                    w.setStyleSheet(combined)
 
                 elif col_type in ("int", "float"):
-                    var = self.master_field_vars[col]
-                    var.set(str(val))
+                    w.setText(str(val) if val is not None else "")
+                    # Reset invalid state
+                    w.setProperty("invalid", "false")
+                    w.style().unpolish(w)
+                    w.style().polish(w)
+                    if is_dirty:
+                        w.setStyleSheet(combined)
 
-                else:  # string (tk.Text)
-                    textbox = self.master_fields[col]
-                    textbox.delete("1.0", "end")
-                    textbox.insert("1.0", str(val))
-                    _deferred_resize.append(textbox)
+                else:
+                    w.setPlainText(str(val) if val is not None else "")
+                    w.setStyleSheet(combined)
 
-        finally:
-            self._master_suppress = False
+            finally:
+                w.blockSignals(False)
 
-        # 待 UI 渲染後再批次調整所有 text cell 高度
-        if _deferred_resize:
-            def _batch_resize(tbs=_deferred_resize):
-                # 強制幾何計算，讓 tk.Text 取得實際渲染寬度，
-                # 否則 count("displaylines") 會按初始 width=30 字元計算，導致行數偏高
-                self.top_container.update_idletasks()
-                for tb in tbs:
-                    self._resize_text_cell(tb)
-            self.after_idle(_batch_resize)
 
-            # 綁定寬度變化事件：視窗縮放時重新計算高度（避免殘留舊的行數）
-            for tb in _deferred_resize:
-                if not getattr(tb, '_has_configure_resize', False):
-                    tb._has_configure_resize = True
-                    tb._prev_width = 0
-                    def _on_width_change(event, w=tb):
-                        if event.width != w._prev_width:
-                            w._prev_width = event.width
-                            self._resize_text_cell(w)
-                    tb.bind("<Configure>", _on_width_change)
+# ── SubTablePanel ─────────────────────────────────────────────────────────────
 
-    def _update_image(self):
-        """只更新圖片（不重建 UI）"""
-        if not self.img_label:
+class SubTablePanel(QWidget):
+    """QTableView with sort, enum delegate, keyboard delete, context menu."""
+    row_deleted = Signal(str, object)  # sheet_full_name, df_index
+
+    def __init__(self, sheet_full_name, cols_cfg, manager, parent=None):
+        super().__init__(parent)
+        self._sheet   = sheet_full_name
+        self._manager = manager
+
+        # Start with empty df — data injected via reload()
+        empty_df = pd.DataFrame(columns=list(
+            (manager.sub_tables.get(sheet_full_name) or pd.DataFrame()).columns
+        ))
+        self._model = SubTableModel(empty_df, cols_cfg, manager, sheet_full_name)
+
+        self._view = QTableView()
+        self._view.setModel(self._model)          # direct, no proxy
+        self._view.setSortingEnabled(True)        # uses SubTableModel.sort()
+        self._view.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._view.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
+        self._view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._view.horizontalHeader().setStretchLastSection(True)
+        self._view.verticalHeader().setDefaultSectionSize(26)
+        self._view.verticalHeader().hide()
+        self._view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._view.customContextMenuRequested.connect(self._ctx_menu)
+        self._view.keyPressEvent = self._key_press
+
+        self._refresh_delegates(cols_cfg)
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.addWidget(self._view)
+
+    def _refresh_delegates(self, cols_cfg):
+        for c, col in enumerate(self._model.df.columns):
+            col_type = (cols_cfg or {}).get(col, {}).get("type", "string")
+            if col_type == "enum":
+                opts = (cols_cfg or {}).get(col, {}).get("options") or [""]
+                self._view.setItemDelegateForColumn(c, EnumDelegate(opts, self._view))
+
+    def reload(self, df, cols_cfg=None):
+        self._model.reload(df, cols_cfg)
+        if cols_cfg:
+            self._refresh_delegates(cols_cfg)
+        if not df.empty:
+            self._view.resizeColumnsToContents()
+
+    def _ctx_menu(self, pos):
+        idx = self._view.indexAt(pos)
+        if not idx.isValid():
             return
+        menu = QMenu(self)
+        menu.addAction("刪除此列", self._delete_selected)
+        menu.exec(self._view.viewport().mapToGlobal(pos))
 
-        use_icon = self.cfg.get("use_icon", False)
-        if not use_icon:
-            return
-
-        img_base_path = self.cfg.get("image_path", "")
-        img_folder = f"{img_base_path}/{self.current_cls_val}"
-        img_file = f"{self.current_master_pk}.png"
-
-        full_path = os.path.join(img_folder, img_file)
-        if not os.path.exists(full_path):
-            full_path = os.path.join(img_base_path, img_file)
-
-        if os.path.exists(full_path):
-            try:
-                pil_img = Image.open(full_path)
-                pil_img.thumbnail((128, 128))
-                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-                self.img_label.configure(image=ctk_img, text="")
-                self.current_image_ref = ctk_img
-            except Exception as e:
-                self.current_image_ref = None
-                self.img_label.configure(text="Error")
+    def _key_press(self, event):
+        if event.key() == Qt.Key_Delete:
+            self._delete_selected()
         else:
-            self.current_image_ref = None
-            self.img_label.configure(text=f"File not found\n{img_file}")
+            QTableView.keyPressEvent(self._view, event)
 
-    def _on_field_change(self, col_name, value):
-        """欄位變更回調（suppress-flag 模式）"""
-        if getattr(self, '_master_suppress', False):
+    def _delete_selected(self):
+        sel = self._view.selectionModel().selectedRows()
+        if not sel:
             return
-        if self.current_master_idx is not None:
-            self.manager.update_cell(False, self.sheet_name, self.current_master_idx, col_name, value)
+        df_idx = self._model.df_index(sel[0].row())
+        if df_idx is not None:
+            self.row_deleted.emit(self._sheet, df_idx)
 
-    def _on_linked_field_change(self, col_name, var):
-        """連結文字欄位變更回調（suppress-flag 模式）"""
-        if getattr(self, '_master_suppress', False):
+    def selected_df_index(self):
+        sel = self._view.selectionModel().selectedRows()
+        if not sel:
+            return None
+        return self._model.df_index(sel[0].row())
+
+
+# ── TableEditor ───────────────────────────────────────────────────────────────
+
+class TableEditor(QWidget):
+    status_message = Signal(str, str)  # text, color
+
+    def __init__(self, table_name, manager, parent=None):
+        super().__init__(parent)
+        self.table_name = table_name
+        self.manager = manager
+        self.df = manager.tables[table_name]
+        self.cfg = manager.config.get(table_name, {})
+        cols = list(self.df.columns)
+        self.cls_key = self.cfg.get("classification_key", cols[0] if cols else "")
+        self.pk_key  = self.cfg.get("primary_key",        cols[0] if cols else "")
+
+        self.current_cls_val    = None
+        self.current_master_idx = None
+        self.current_master_pk  = None
+
+        self._field_panel: FieldEditorWidget | None = None
+        self._sub_panels: dict[str, SubTablePanel] = {}  # tab_name → panel
+
+        self._setup_ui()
+        self._load_cls_list()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(3)
+        root.addWidget(splitter)
+
+        # ── Left: classification ──────────────────────────────────────────────
+        left = QWidget()
+        left.setMinimumWidth(130)
+        left.setMaximumWidth(200)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(0)
+        lv.addWidget(_section_label(f"▣  分類 ({self.cls_key})"))
+        self._cls_list = QListWidget()
+        self._cls_list.currentItemChanged.connect(self._on_cls_changed)
+        lv.addWidget(self._cls_list, 1)
+        lv.addWidget(_sep_frame())
+
+        cls_btns = QHBoxLayout()
+        cls_btns.setContentsMargins(4, 4, 4, 4)
+        b_add_cls = _accent_btn("+", "add");   b_add_cls.setFixedWidth(28)
+        b_del_cls = _accent_btn("−", "del");   b_del_cls.setFixedWidth(28)
+        b_up_cls  = QPushButton("▲");           b_up_cls.setFixedWidth(28)
+        b_dn_cls  = QPushButton("▼");           b_dn_cls.setFixedWidth(28)
+        b_add_cls.clicked.connect(self.add_classification)
+        b_del_cls.clicked.connect(self.delete_classification)
+        b_up_cls.clicked.connect(lambda: self.move_classification(-1))
+        b_dn_cls.clicked.connect(lambda: self.move_classification(1))
+        for b in [b_add_cls, b_del_cls, b_up_cls, b_dn_cls]:
+            cls_btns.addWidget(b)
+        lv.addLayout(cls_btns)
+        splitter.addWidget(left)
+
+        # ── Mid: item list ────────────────────────────────────────────────────
+        mid = QWidget()
+        mid.setMinimumWidth(160)
+        mid.setMaximumWidth(260)
+        mv = QVBoxLayout(mid)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(0)
+        mv.addWidget(_section_label("☰  項目清單"))
+
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("搜尋…")
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setContentsMargins(4, 2, 4, 2)
+        self._filter_edit.textChanged.connect(self._apply_filter)
+        mv.addWidget(self._filter_edit)
+
+        self._item_list = QListWidget()
+        self._item_list.currentItemChanged.connect(self._on_item_changed)
+        mv.addWidget(self._item_list, 1)
+        mv.addWidget(_sep_frame())
+
+        item_btns1 = QHBoxLayout()
+        item_btns1.setContentsMargins(4, 4, 4, 2)
+        b_add  = _accent_btn("+ 新增", "add")
+        b_copy = QPushButton("複製")
+        b_add.clicked.connect(self.add_master_item)
+        b_copy.clicked.connect(self.copy_master_item)
+        item_btns1.addWidget(b_add, 1)
+        item_btns1.addWidget(b_copy)
+        mv.addLayout(item_btns1)
+
+        item_btns2 = QHBoxLayout()
+        item_btns2.setContentsMargins(4, 2, 4, 4)
+        b_up   = QPushButton("▲");    b_up.setFixedWidth(32)
+        b_dn   = QPushButton("▼");    b_dn.setFixedWidth(32)
+        b_del  = _accent_btn("刪除", "del")
+        b_up.clicked.connect(lambda: self.move_master_item(-1))
+        b_dn.clicked.connect(lambda: self.move_master_item(1))
+        b_del.clicked.connect(self.delete_master_item)
+        item_btns2.addWidget(b_up)
+        item_btns2.addWidget(b_dn)
+        item_btns2.addStretch(1)
+        item_btns2.addWidget(b_del)
+        mv.addLayout(item_btns2)
+        splitter.addWidget(mid)
+
+        # ── Right: editor + sub-tables ────────────────────────────────────────
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setHandleWidth(4)
+
+        # Field editor area
+        field_area = QWidget()
+        field_area.setMinimumHeight(120)
+        fv = QVBoxLayout(field_area)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.setSpacing(0)
+        fv.addWidget(_section_label("◉  欄位資料"))
+        self._field_container = QWidget()
+        fv.addWidget(self._field_container, 1)
+        fl = QVBoxLayout(self._field_container)
+        fl.setContentsMargins(0, 0, 0, 0)
+
+        right_splitter.addWidget(field_area)
+
+        # Sub-tables
+        sub_area = QWidget()
+        sub_area.setMinimumHeight(100)
+        sv = QVBoxLayout(sub_area)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+        sub_hdr = QWidget()
+        sub_hdr.setFixedHeight(30)
+        sub_hdr.setStyleSheet("background:#2a2a3a;")
+        sh = QHBoxLayout(sub_hdr)
+        sh.setContentsMargins(6, 0, 4, 0)
+        lbl_sub = QLabel("◦  子資料表")
+        lbl_sub.setStyleSheet("color:#A0C4E8; font-weight:bold;")
+        b_add_sub  = _accent_btn("+ 新增", "add"); b_add_sub.setFixedHeight(22)
+        b_del_sub  = _accent_btn("刪除",   "del"); b_del_sub.setFixedHeight(22)
+        b_up_sub   = QPushButton("▲"); b_up_sub.setFixedSize(26, 22)
+        b_dn_sub   = QPushButton("▼"); b_dn_sub.setFixedSize(26, 22)
+        b_cp_sub   = QPushButton("複製"); b_cp_sub.setFixedHeight(22)
+        b_add_sub.clicked.connect(self.add_sub_item)
+        b_del_sub.clicked.connect(self.delete_sub_item)
+        b_up_sub.clicked.connect(lambda: self.move_sub_item(-1))
+        b_dn_sub.clicked.connect(lambda: self.move_sub_item(1))
+        b_cp_sub.clicked.connect(self.copy_sub_item)
+        sh.addWidget(lbl_sub)
+        sh.addStretch(1)
+        for b in [b_cp_sub, b_up_sub, b_dn_sub, b_add_sub, b_del_sub]:
+            sh.addWidget(b)
+        sv.addWidget(sub_hdr)
+        sv.addWidget(_sep_frame())
+
+        self._sub_tabs = QTabWidget()
+        self._sub_tabs.setDocumentMode(True)
+        sv.addWidget(self._sub_tabs, 1)
+
+        right_splitter.addWidget(sub_area)
+        right_splitter.setSizes([300, 200])
+        splitter.addWidget(right_splitter)
+
+        splitter.setSizes([150, 200, 600])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 1)
+
+        # Context menus
+        self._cls_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._cls_list.customContextMenuRequested.connect(self._cls_ctx_menu)
+        self._item_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._item_list.customContextMenuRequested.connect(self._item_ctx_menu)
+
+        # Build sub-table tabs (empty placeholders)
+        self._build_sub_tabs()
+
+    # ── Classification ────────────────────────────────────────────────────────
+
+    def _load_cls_list(self):
+        self._cls_list.blockSignals(True)
+        self._cls_list.clear()
+        if self.cls_key not in self.df.columns:
+            self._cls_list.blockSignals(False)
             return
-        if self.current_master_idx is not None:
-            # 取得 Key（從快取讀取，不碰 CTkEntry.configure）
-            _, textbox = self.master_fields[col_name]
-            key = getattr(textbox, '_linked_key', None)
-            if key is None:
-                return
-            # 更新文字表
-            self.manager.update_linked_text(key, var.get())
+        groups = self.df[self.cls_key].unique()
+        for g in groups:
+            count = int((self.df[self.cls_key] == g).sum())
+            item = QListWidgetItem(f"{g}  ({count})")
+            item.setData(Qt.UserRole, g)
+            self._cls_list.addItem(item)
+            if str(g) == str(self.current_cls_val):
+                self._cls_list.setCurrentItem(item)
+        self._cls_list.blockSignals(False)
+
+    def _on_cls_changed(self, cur, _prev):
+        if cur is None:
+            return
+        g = cur.data(Qt.UserRole)
+        self.current_cls_val = g
+        self._load_item_list()
 
     def add_classification(self):
-        """ 新增分類 """
-        dialog = ctk.CTkInputDialog(text="請輸入新分類名稱:", title="新增分類")
-        new_cls = dialog.get_input()
-        if not new_cls: return
-
-        dialog_id = ctk.CTkInputDialog(text="請輸入第一筆資料的 ID (Key):", title="初始資料")
-        new_id = dialog_id.get_input()
-        if not new_id: return
-
-        if new_id in self.df[self.pk_key].astype(str).values:
-            messagebox.showerror("錯誤", "此 ID 已存在")
+        name, ok = QInputDialog.getText(self, "新增分類", "分類名稱:")
+        if not ok or not name.strip():
             return
-
+        name = name.strip()
+        if name in self.df[self.cls_key].values:
+            QMessageBox.warning(self, "錯誤", "此分類已存在")
+            return
         new_row = {col: "" for col in self.df.columns}
-        new_row[self.cls_key] = new_cls
-        new_row[self.pk_key] = new_id
-
+        new_row[self.cls_key] = name
+        if self.pk_key in self.df.columns:
+            new_id, ok2 = QInputDialog.getText(self, "新增分類", f"首筆資料的 {self.pk_key}:")
+            if not ok2 or not new_id.strip():
+                return
+            new_row[self.pk_key] = new_id.strip()
         self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
+        self.manager.tables[self.table_name] = self.df
         self.manager.dirty = True
-        self.load_classification_list()
-        self.load_items_by_group(new_cls)
+        self._reload_all(select_cls=name)
 
     def delete_classification(self):
-        """ 刪除選取的分類 """
-        if not self.current_cls_val: return
-        if not messagebox.askyesno("刪除確認", f"確定要刪除分類 [{self.current_cls_val}] 及其下所有資料嗎？"): return
-
-        self.df = self.df[self.df[self.cls_key] != self.current_cls_val]
-        self.df.reset_index(drop=True, inplace=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
+        g = self.current_cls_val
+        if g is None:
+            return
+        if QMessageBox.question(self, "確認刪除", f"刪除分類 [{g}] 及其所有資料？",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.df = self.df[self.df[self.cls_key] != g].reset_index(drop=True)
+        self.manager.tables[self.table_name] = self.df
         self.manager.dirty = True
-
         self.current_cls_val = None
         self.current_master_idx = None
+        self._reload_all()
 
-        # 清空項目列表
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
-
-        self.load_classification_list()
-        self.load_sub_tables(None)
-
-    def add_master_item(self):
-        """ 新增項目到當前分類（插在該分類最後） """
-        if not self.current_cls_val:
-            messagebox.showwarning("提示", "請先選擇左側分類")
+    def move_classification(self, delta):
+        if self.current_cls_val is None:
             return
-
-        dialog = ctk.CTkInputDialog(text="請輸入新項目 ID:", title="新增項目")
-        new_id = dialog.get_input()
-        if not new_id: return
-
-        if new_id in self.df[self.pk_key].astype(str).values:
-            messagebox.showerror("錯誤", "ID 已存在")
-            return
-
-        new_row = {col: "" for col in self.df.columns}
-        new_row[self.cls_key] = self.current_cls_val
-        new_row[self.pk_key] = new_id
-
-        cls_rows = self.df[self.df[self.cls_key] == self.current_cls_val]
-        insert_idx = cls_rows.index.max() + 1 if not cls_rows.empty else len(self.df)
-
-        top = self.df.iloc[:insert_idx]
-        bottom = self.df.iloc[insert_idx:]
-        self.df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
-        self.manager.dirty = True
-
-        self.load_items_by_group(self.current_cls_val)
-
-        new_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
-        self.load_editor(new_idx)
-
-    def delete_master_item(self):
-        """ 刪除選取的項目 """
-        if self.current_master_idx is None:
-            messagebox.showwarning("提示", "請先選擇要刪除的項目")
-            return
-
-        if not messagebox.askyesno("刪除確認", "確定要刪除此筆資料嗎？"): return
-
-        self.df.drop(self.current_master_idx, inplace=True)
-        self.df.reset_index(drop=True, inplace=True)
-        self.manager.master_dfs[self.sheet_name] = self.df
-        self.manager.dirty = True
-
-        # 從緩存中移除
-        if self.current_master_idx in self.item_buttons:
-            self.item_buttons[self.current_master_idx].destroy()
-            del self.item_buttons[self.current_master_idx]
-
-        self.current_master_idx = None
-        self.load_items_by_group(self.current_cls_val)
-        self.load_sub_tables(None)
-
-    def _select_sub_row(self, tab_name, row_frame):
-        """選中子表行（高亮顯示）"""
-        # 取消所有行的高亮
-        for rf in self.sub_table_active_rows.get(tab_name, []):
-            rf.configure(highlightthickness=0)
-
-        # 高亮選中行
-        row_frame.configure(highlightthickness=2, highlightbackground=_CELL_FOCUS_BORDER)
-        self.current_sub_row_idx = row_frame._del_ctx["row_idx"]
-
-    def _highlight_current_sub_row(self, tab_name):
-        """重新高亮當前選中的子表行"""
-        for rf in self.sub_table_active_rows.get(tab_name, []):
-            if rf._del_ctx["row_idx"] == self.current_sub_row_idx:
-                rf.configure(highlightthickness=2, highlightbackground=_CELL_FOCUS_BORDER)
-            else:
-                rf.configure(highlightthickness=0)
-
-    def move_sub_item(self, direction):
-        """移動子表行順序 (direction: -1=上, +1=下)"""
-        if self.current_sub_row_idx is None or self.current_master_pk is None:
-            return
-
+        groups = list(self.df[self.cls_key].unique())
         try:
-            current_tab = self.sub_tables_tabs.get()
-        except:
-            return
-
-        if current_tab == "無子表":
-            return
-
-        full_sub_name = f"{self.sheet_name}#{current_tab}"
-        sub_df = self.manager.sub_dfs.get(full_sub_name)
-        if sub_df is None:
-            return
-
-        sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
-        fk_key = sub_cfg.get("foreign_key", self.pk_key)
-
-        # 取得同母表的 siblings index list
-        mask = sub_df[fk_key].astype(str) == str(self.current_master_pk)
-        siblings_indices = list(sub_df[mask].index)
-
-        try:
-            rel_pos = siblings_indices.index(self.current_sub_row_idx)
+            pos = [str(g) for g in groups].index(str(self.current_cls_val))
         except ValueError:
             return
-
-        new_rel_pos = rel_pos + direction
-        if new_rel_pos < 0 or new_rel_pos >= len(siblings_indices):
-            return  # 已在邊界
-
-        idx_a = siblings_indices[rel_pos]
-        idx_b = siblings_indices[new_rel_pos]
-
-        # 交換兩行
-        row_a = sub_df.iloc[idx_a].copy()
-        row_b = sub_df.iloc[idx_b].copy()
-        sub_df.iloc[idx_a] = row_b
-        sub_df.iloc[idx_b] = row_a
-        self.manager.sub_dfs[full_sub_name] = sub_df
-        self.manager.dirty = True
-
-        # 更新選中索引
-        self.current_sub_row_idx = idx_b
-
-        # 刷新子表
-        self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
-        self._highlight_current_sub_row(current_tab)
-
-    def copy_sub_item(self):
-        """複製子表行"""
-        if self.current_sub_row_idx is None or self.current_master_pk is None:
+        new_pos = pos + delta
+        if new_pos < 0 or new_pos >= len(groups):
             return
+        groups[pos], groups[new_pos] = groups[new_pos], groups[pos]
+        self.df = pd.concat(
+            [self.df[self.df[self.cls_key] == g] for g in groups],
+            ignore_index=True
+        )
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        self._reload_all(select_cls=self.current_cls_val)
 
+    # ── Item list ─────────────────────────────────────────────────────────────
+
+    def _load_item_list(self):
+        query = self._filter_edit.text().strip().lower()
+        self._item_list.blockSignals(True)
+        self._item_list.clear()
+        if self.current_cls_val is None or self.pk_key not in self.df.columns:
+            self._item_list.blockSignals(False)
+            return
+        sub_df = self.df[self.df[self.cls_key] == self.current_cls_val]
+        for df_idx, row in sub_df.iterrows():
+            pk_val = str(row[self.pk_key])
+            if query and query not in pk_val.lower():
+                continue
+            item = QListWidgetItem(pk_val)
+            item.setData(Qt.UserRole, df_idx)
+            self._item_list.addItem(item)
+            if df_idx == self.current_master_idx:
+                self._item_list.setCurrentItem(item)
+        self._item_list.blockSignals(False)
+
+    def _apply_filter(self, _text=""):
+        self._load_item_list()
+
+    def _on_item_changed(self, cur, _prev):
+        if cur is None:
+            return
+        df_idx = cur.data(Qt.UserRole)
+        self._load_editor(df_idx)
+
+    def add_master_item(self):
+        if self.current_cls_val is None:
+            QMessageBox.warning(self, "提示", "請先選擇分類")
+            return
+        new_id, ok = QInputDialog.getText(self, "新增項目", f"{self.pk_key}:")
+        if not ok or not new_id.strip():
+            return
+        new_id = new_id.strip()
+        if new_id in self.df[self.pk_key].astype(str).values:
+            QMessageBox.warning(self, "錯誤", "此 ID 已存在")
+            return
+        new_row = {col: "" for col in self.df.columns}
+        new_row[self.cls_key] = self.current_cls_val
+        new_row[self.pk_key]  = new_id
+        cls_rows = self.df[self.df[self.cls_key] == self.current_cls_val]
+        insert_after = cls_rows.index.max() + 1 if not cls_rows.empty else len(self.df)
+        top, bot = self.df.iloc[:insert_after], self.df.iloc[insert_after:]
+        self.df = pd.concat([top, pd.DataFrame([new_row]), bot], ignore_index=True)
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        new_df_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
+        self._reload_all(select_cls=self.current_cls_val, select_idx=new_df_idx)
+
+    def copy_master_item(self):
+        if self.current_master_idx is None:
+            return
+        new_id, ok = QInputDialog.getText(self, "複製項目", f"新的 {self.pk_key}:")
+        if not ok or not new_id.strip():
+            return
+        new_id = new_id.strip()
+        if new_id in self.df[self.pk_key].astype(str).values:
+            QMessageBox.warning(self, "錯誤", "此 ID 已存在")
+            return
+        new_row = self.df.loc[self.current_master_idx].copy()
+        new_row[self.pk_key] = new_id
+        self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        new_df_idx = self.df[self.df[self.pk_key].astype(str) == str(new_id)].index[0]
+        self._reload_all(select_cls=self.current_cls_val, select_idx=new_df_idx)
+
+    def delete_master_item(self):
+        if self.current_master_idx is None:
+            return
+        pk = str(self.df.at[self.current_master_idx, self.pk_key])
+        self.df.drop(self.current_master_idx, inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        self.current_master_idx = None
+        self._reload_all(select_cls=self.current_cls_val)
+        self.status_message.emit(f"已刪除 {pk}", "#e09040")
+
+    def move_master_item(self, delta):
+        if self.current_master_idx is None or self.current_cls_val is None:
+            return
+        cls_idxs = list(self.df[self.df[self.cls_key] == self.current_cls_val].index)
         try:
-            current_tab = self.sub_tables_tabs.get()
-        except:
+            pos = cls_idxs.index(self.current_master_idx)
+        except ValueError:
             return
-
-        if current_tab == "無子表":
+        new_pos = pos + delta
+        if new_pos < 0 or new_pos >= len(cls_idxs):
             return
-
-        full_sub_name = f"{self.sheet_name}#{current_tab}"
-        sub_df = self.manager.sub_dfs.get(full_sub_name)
-        if sub_df is None or self.current_sub_row_idx not in sub_df.index:
-            return
-
-        sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
-        fk_key = sub_cfg.get("foreign_key", self.pk_key)
-
-        # 複製該行
-        new_row = sub_df.loc[self.current_sub_row_idx].copy()
-
-        # 插入位置：同母表 siblings 的末尾
-        mask = sub_df[fk_key].astype(str) == str(self.current_master_pk)
-        siblings = sub_df[mask]
-        insert_idx = siblings.index.max() + 1 if not siblings.empty else len(sub_df)
-
-        top = sub_df.iloc[:insert_idx]
-        bottom = sub_df.iloc[insert_idx:]
-        sub_df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
-        self.manager.sub_dfs[full_sub_name] = sub_df
+        cls_idxs[pos], cls_idxs[new_pos] = cls_idxs[new_pos], cls_idxs[pos]
+        other_idxs = [i for i in self.df.index if i not in cls_idxs]
+        # Re-assemble: items before, cls items reordered, items after
+        all_cls = list(self.df[self.df[self.cls_key] == self.current_cls_val].index)
+        first_cls = all_cls[0]
+        before = [i for i in other_idxs if i < first_cls]
+        after  = [i for i in other_idxs if i > max(all_cls)]
+        new_order = before + cls_idxs + after
+        self.df = self.df.loc[new_order].reset_index(drop=True)
+        self.manager.tables[self.table_name] = self.df
         self.manager.dirty = True
+        new_idx = self.df[self.df[self.pk_key].astype(str) == str(self.current_master_pk)].index
+        sel_idx = new_idx[0] if not new_idx.empty else None
+        self._reload_all(select_cls=self.current_cls_val, select_idx=sel_idx)
 
-        # 刷新子表
-        self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
+    # ── Field editor ──────────────────────────────────────────────────────────
+
+    def _load_editor(self, df_idx):
+        self.current_master_idx = df_idx
+        if df_idx not in self.df.index:
+            return
+        row_data = self.df.loc[df_idx]
+        self.current_master_pk = row_data[self.pk_key]
+
+        if self._field_panel is None:
+            self._field_panel = FieldEditorWidget(self._field_container)
+            self._field_panel.field_changed.connect(self._on_field_change)
+            self._field_container.layout().addWidget(self._field_panel)
+            self._field_panel.build_for(self.df, self.cfg, self.table_name, self.manager)
+
+        self._field_panel.load_row(row_data, df_idx)
+        self._refresh_sub_tables()
+
+    def _on_field_change(self, col, value):
+        if self.current_master_idx is None:
+            return
+        self.manager.update_cell(self.table_name, self.current_master_idx, col, value)
+
+    # ── Sub-tables ────────────────────────────────────────────────────────────
+
+    def _build_sub_tabs(self):
+        """Register sub-tables with placeholder tabs. Panels created lazily in _refresh_sub_tables."""
+        self._sub_tabs.clear()
+        self._sub_panels.clear()
+        self._sub_tab_order = []   # ordered list of tab_names
+        prefix = self.table_name + "."
+        for key in self.manager.sub_tables:
+            if not key.startswith(prefix):
+                continue
+            tab_name = key[len(prefix):]
+            self._sub_tab_order.append(tab_name)
+            self._sub_tabs.addTab(QWidget(), tab_name)   # cheap placeholder
+
+    def _refresh_sub_tables(self):
+        if self.current_master_pk is None:
+            return
+        prefix = self.table_name + "."
+        for i, tab_name in enumerate(self._sub_tab_order):
+            full = prefix + tab_name
+            sub_df = self.manager.sub_tables.get(full)
+            if sub_df is None:
+                continue
+            sub_cfg  = self.cfg.get("sub_tables", {}).get(tab_name, {})
+            fk_key   = sub_cfg.get("foreign_key", self.pk_key)
+            cols_cfg = sub_cfg.get("columns", {})
+            filtered = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
+
+            if tab_name not in self._sub_panels:
+                # First time: create panel, replace placeholder tab
+                panel = SubTablePanel(full, cols_cfg, self.manager)
+                panel.row_deleted.connect(self._on_sub_delete)
+                self._sub_panels[tab_name] = panel
+                self._sub_tabs.removeTab(i)
+                self._sub_tabs.insertTab(i, panel, tab_name)
+
+            self._sub_panels[tab_name].reload(filtered, cols_cfg)
+
+    def _on_sub_delete(self, sheet_full, df_idx):
+        sub_df = self.manager.sub_tables.get(sheet_full)
+        if sub_df is None or df_idx not in sub_df.index:
+            return
+        sub_df.drop(df_idx, inplace=True)
+        sub_df.reset_index(drop=True, inplace=True)
+        self.manager.sub_tables[sheet_full] = sub_df
+        self.manager.dirty = True
+        self._refresh_sub_tables()
+        self.status_message.emit("已刪除子表列", "#e09040")
+
+    def _current_sub_panel(self) -> SubTablePanel | None:
+        idx = self._sub_tabs.currentIndex()
+        if idx < 0:
+            return None
+        tab_name = self._sub_tabs.tabText(idx)
+        return self._sub_panels.get(tab_name)
 
     def add_sub_item(self):
-        """ 新增子表資料（插在該母表最後） """
         if self.current_master_pk is None:
-            messagebox.showwarning("提示", "請先選擇母表資料")
             return
-
-        try:
-            current_tab = self.sub_tables_tabs.get()
-        except:
+        panel = self._current_sub_panel()
+        if panel is None:
             return
-
-        if current_tab == "無子表":
-            return
-
-        full_sub_name = f"{self.sheet_name}#{current_tab}"
-        sub_df = self.manager.sub_dfs.get(full_sub_name)
+        tab_name = self._sub_tabs.tabText(self._sub_tabs.currentIndex())
+        full = self.table_name + "." + tab_name
+        sub_df = self.manager.sub_tables.get(full)
         if sub_df is None:
             return
-
-        sub_cfg = self.cfg.get("sub_sheets", {}).get(current_tab, {})
+        sub_cfg = self.cfg.get("sub_tables", {}).get(tab_name, {})
         fk_key = sub_cfg.get("foreign_key", self.pk_key)
-
         new_row = {col: "" for col in sub_df.columns}
         new_row[fk_key] = self.current_master_pk
-
-        siblings = sub_df[sub_df[fk_key] == self.current_master_pk]
-        insert_idx = siblings.index.max() + 1 if not siblings.empty else len(sub_df)
-
-        top = sub_df.iloc[:insert_idx]
-        bottom = sub_df.iloc[insert_idx:]
-        sub_df = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
-        self.manager.sub_dfs[full_sub_name] = sub_df
+        siblings = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
+        insert_at = siblings.index.max() + 1 if not siblings.empty else len(sub_df)
+        top, bot = sub_df.iloc[:insert_at], sub_df.iloc[insert_at:]
+        sub_df = pd.concat([top, pd.DataFrame([new_row]), bot], ignore_index=True)
+        self.manager.sub_tables[full] = sub_df
         self.manager.dirty = True
+        self._refresh_sub_tables()
 
-        # 重新載入該 Tab（會自動重用行）
-        self._update_sub_table_data(current_tab, full_sub_name, self.current_master_pk)
-
-    def delete_sub_item(self, sheet_full_name, row_idx):
-        """ 刪除子表資料 (由每一列的 X 按鈕觸發) """
-        if not messagebox.askyesno("確認", "刪除此列子表資料？"): return
-
-        sub_df = self.manager.sub_dfs[sheet_full_name]
-        sub_df.drop(row_idx, inplace=True)
-        sub_df.reset_index(drop=True, inplace=True)
-        self.manager.sub_dfs[sheet_full_name] = sub_df
-        self.manager.dirty = True
-
-        # 只更新受影響的單一 Tab，不重建全部子表結構（避免卡頓）
-        short_name = sheet_full_name.split("#")[1]
-        if short_name in self.sub_table_frames:
-            self._update_sub_table_data(short_name, sheet_full_name, self.current_master_pk)
-        else:
-            # 若結構不存在（罕見情況）則回退到完整重建
-            self.load_sub_tables(self.current_master_pk)
-
-    def load_sub_tables(self, master_id):
-        """載入子表（保持原版實現或使用優化版）"""
-        # 取得相關子表
-        related_sheets = [s for s in self.manager.sub_dfs if s.startswith(self.sheet_name + "#")]
-
-        if not related_sheets:
-            # 清空所有 Tab
-            for tab_name in list(self.sub_tables_tabs._tab_dict.keys()):
-                self.sub_tables_tabs.delete(tab_name)
-            self.sub_tables_tabs.add("無子表")
+    def delete_sub_item(self):
+        panel = self._current_sub_panel()
+        if panel is None:
             return
-
-        # 取得現有和需要的 Tab
-        existing_tabs = set(self.sub_tables_tabs._tab_dict.keys())
-        needed_tabs = {s.split("#")[1] for s in related_sheets}
-
-        # 1. 移除不需要的 Tab
-        for tab in (existing_tabs - needed_tabs):
-            self.sub_tables_tabs.delete(tab)
-            # 清理緩存
-            if tab in self.sub_table_frames:
-                del self.sub_table_frames[tab]
-            if tab in self.sub_table_headers:
-                del self.sub_table_headers[tab]
-            if tab in self.sub_table_row_pools:
-                del self.sub_table_row_pools[tab]
-            if tab in self.sub_table_active_rows:
-                del self.sub_table_active_rows[tab]
-
-        # 2. 為每個子表更新內容
-        for sheet in related_sheets:
-            short_name = sheet.split("#")[1]
-
-            # 如果 Tab 不存在，創建它
-            if short_name not in existing_tabs:
-                self.sub_tables_tabs.add(short_name)
-                self._create_sub_table_structure(short_name)
-
-            # 更新該 Tab 的資料（重用行）
-            self._update_sub_table_data(short_name, sheet, master_id)
-
-    def _create_sub_table_structure(self, tab_name):
-        """創建子表的固定結構 (標題固定在頂部，資料區域獨立捲動)"""
-        tab_frame = self.sub_tables_tabs.tab(tab_name)
-
-        # 1. 外層容器 — 原生 tk.Frame
-        scroll_container = tk.Frame(tab_frame, bg=_BG)
-        scroll_container.pack(fill="both", expand=True)
-
-        # 2. 固定標題區 (header_canvas — 只做水平捲動，不做垂直捲動)
-        header_canvas = tk.Canvas(scroll_container, bg=_BG_HEADER,
-                                  highlightthickness=0, bd=0, height=30)
-        header_canvas.pack(fill="x", side="top")
-
-        header_container = tk.Frame(header_canvas, bg=_BG_HEADER, height=30)
-        header_canvas_window = header_canvas.create_window((0, 0), window=header_container, anchor="nw")
-
-        def on_header_configure(_event=None):
-            header_canvas.configure(scrollregion=header_canvas.bbox("all"))
-            # 更新 header_canvas 的高度以符合內容
-            h = header_container.winfo_reqheight()
-            header_canvas.configure(height=h)
-
-        header_container.bind("<Configure>", on_header_configure)
-
-        # 3. 資料區容器 (canvas + scrollbars)
-        body_frame = tk.Frame(scroll_container, bg=_BG)
-        body_frame.pack(fill="both", expand=True)
-
-        import tkinter.ttk as ttk
-        canvas = tk.Canvas(body_frame, bg=_BG, highlightthickness=0, bd=0)
-
-        v_scrollbar = ttk.Scrollbar(body_frame, orient="vertical",
-                                    style="Dark.Vertical.TScrollbar",
-                                    command=canvas.yview)
-        v_scrollbar.pack(side="right", fill="y")
-
-        # 水平捲軸同步驅動 data canvas 和 header canvas
-        def xview_sync(*args):
-            canvas.xview(*args)
-            header_canvas.xview(*args)
-
-        h_scrollbar = ttk.Scrollbar(body_frame, orient="horizontal",
-                                    style="Dark.Horizontal.TScrollbar",
-                                    command=xview_sync)
-        h_scrollbar.pack(side="bottom", fill="x")
-
-        canvas.pack(side="left", fill="both", expand=True)
-
-        # data canvas 的 xscrollcommand 同步更新 scrollbar 和 header 位置
-        def on_data_xscroll(*args):
-            h_scrollbar.set(*args)
-            header_canvas.xview_moveto(args[0])
-
-        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=on_data_xscroll)
-
-        # 4. 資料框架 (使用原生 tk.Frame 避免殘影)
-        data_container = tk.Frame(canvas, bg=_BG)
-        canvas_window = canvas.create_window((0, 0), window=data_container, anchor="nw")
-
-        # === 視窗縮放邏輯 ===
-        def sync_header_width():
-            """同步 header canvas 的寬度與 scrollregion 以配合資料 canvas"""
-            req_w = max(data_container.winfo_reqwidth(),
-                        header_container.winfo_reqwidth(),
-                        canvas.winfo_width())
-            header_canvas.itemconfig(header_canvas_window, width=req_w)
-            header_canvas.configure(scrollregion=(0, 0, req_w,
-                                                  header_container.winfo_reqheight()))
-
-        def _update_widths():
-            """統一更新 data canvas window 寬度 + header 同步"""
-            # 批次更新時凍結，避免每行 pack/resize 都觸發重繪
-            if self.sub_table_frames.get(tab_name, {}).get('_freeze', False):
-                return
-            req_width = max(data_container.winfo_reqwidth(),
-                            header_container.winfo_reqwidth())
-            canvas_w = canvas.winfo_width()
-            target_w = max(canvas_w, req_width)
-            canvas.itemconfig(canvas_window, width=target_w)
-            bbox = canvas.bbox("all")
-            if bbox:
-                canvas_h = canvas.winfo_height()
-                region_h = max(bbox[3], canvas_h)
-                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], region_h))
-            sync_header_width()
-
-        def on_frame_configure(_event=None):
-            _update_widths()
-
-        def on_canvas_configure(_event=None):
-            _update_widths()
-
-        data_container.bind("<Configure>", on_frame_configure)
-        canvas.bind("<Configure>", on_canvas_configure)
-
-        # 標記 Canvas 用途 (供 App 層級滾輪路由識別)
-        canvas._is_sub_table_canvas = True
-        header_canvas._is_sub_table_header_canvas = True
-        header_canvas._linked_data_canvas = canvas
-
-        # 緩存容器
-        self.sub_table_frames[tab_name] = {
-            'header': header_container,
-            'header_canvas': header_canvas,
-            'data': data_container,
-            'canvas': canvas,
-            'scroll_container': scroll_container,
-            '_freeze': False,
-            '_update_widths': _update_widths,
-        }
-        self.sub_table_row_pools[tab_name] = []
-        self.sub_table_active_rows[tab_name] = []
-
-    def _update_sub_table_data(self, tab_name, sheet_full_name, master_id):
-        """更新子表資料（智能重用行）"""
-
-        # 取得資料
-        sub_df = self.manager.sub_dfs[sheet_full_name]
-        sub_cfg = self.cfg.get("sub_sheets", {}).get(tab_name, {})
-        sub_cols_cfg = sub_cfg.get("columns", {})
-        fk = sub_cfg.get("foreign_key", self.pk_key)
-
-        if fk not in sub_df.columns:
-            self._show_error_in_tab(tab_name, f"錯誤: 找不到關鍵欄位 {fk}")
+        tab_name = self._sub_tabs.tabText(self._sub_tabs.currentIndex())
+        full = self.table_name + "." + tab_name
+        df_idx = panel.selected_df_index()
+        if df_idx is None:
             return
+        self._on_sub_delete(full, df_idx)
 
-        # 篩選資料
-        try:
-            mask = sub_df[fk].astype(str) == str(master_id)
-            filtered_rows = sub_df[mask]
-        except:
-            filtered_rows = sub_df.head(0)
-
-        # 取得容器
-        frames = self.sub_table_frames.get(tab_name)
-        if not frames:
+    def move_sub_item(self, delta):
+        panel = self._current_sub_panel()
+        if panel is None:
             return
-
-        header_frame = frames['header']
-        data_frame = frames['data']
-
-        # 更新標題（只在需要時）
-        headers = list(sub_df.columns)
-        if not header_frame.winfo_children():
-            self._build_sub_table_header(header_frame, headers, sub_cols_cfg)
-
-        # === 三階段更新：凍結 → 批次資料+pack → flush → 批次 resize → 解凍 ===
-        frames['_freeze'] = True
-
-        try:
-            # ── 階段 1：回收舊行 + 填入新資料 + pack（不做 resize）──
-            active_rows = self.sub_table_active_rows.get(tab_name, [])
-            row_pool = self.sub_table_row_pools.get(tab_name, [])
-
-            for row_frame in active_rows:
-                row_frame.pack_forget()
-                row_pool.append(row_frame)
-
-            self.sub_table_active_rows[tab_name] = []
-
-            if filtered_rows.empty:
-                if not hasattr(data_frame, '_empty_label'):
-                    data_frame._empty_label = tk.Label(data_frame, text="(此項目無資料)",
-                                                        bg=_BG, fg="gray", font=_CELL_FONT)
-                data_frame._empty_label.pack(pady=10)
-                return
-            else:
-                if hasattr(data_frame, '_empty_label'):
-                    data_frame._empty_label.pack_forget()
-
-            needed_rows = len(filtered_rows)
-            available_rows = len(row_pool)
-            new_active_rows = []
-
-            for i, (idx, row) in enumerate(filtered_rows.iterrows()):
-                row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
-                if i < available_rows:
-                    row_frame = row_pool[i]
-                    self._update_sub_table_row(row_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                    row_frame.configure(bg=row_bg)
-                    row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
-                else:
-                    row_frame = self._create_sub_table_row(data_frame, headers, row, idx, sheet_full_name, sub_cols_cfg)
-                    row_frame.configure(bg=row_bg)
-                    row_frame.pack(fill="x", pady=1, padx=2, ipady=3)
-                new_active_rows.append(row_frame)
-
-            self.sub_table_active_rows[tab_name] = new_active_rows
-            self.sub_table_row_pools[tab_name] = row_pool[needed_rows:]
-
-            # ── 強制幾何計算，讓 tk.Text 取得實際寬度後 count("displaylines") 才準確 ──
-            # _freeze=True 會阻擋 _update_widths，不會產生連鎖重繪
-            data_frame.update_idletasks()
-
-            # ── 批次 resize ──
-            for rf in new_active_rows:
-                self._auto_resize_row(rf, headers)
-
-        finally:
-            frames['_freeze'] = False
-            frames['_update_widths']()
-
-    def _build_sub_table_header(self, header_frame, headers, cols_cfg):
-        """建立子表標題（只執行一次）— 原生 tk.Label"""
-        # 操作欄
-        tk.Label(header_frame, text="操作", width=8,
-                 bg=_BG_HEADER, fg=_CELL_FG,
-                 font=("微軟正黑體", 10, "bold"), anchor="w").pack(side="left", padx=2)
-
-        # 資料欄
-        for col in headers:
-            col_info = cols_cfg.get(col, {})
-            is_linked = col_info.get("link_to_text", False)
-
-            label_text = f"{col} 🔗" if is_linked else col
-            width = 22 if is_linked else 15  # tk.Label width in chars
-
-            tk.Label(header_frame, text=label_text, width=width,
-                     bg=_BG_HEADER, fg=_CELL_FG,
-                     font=("微軟正黑體", 10, "bold"), anchor="w").pack(side="left", padx=2)
-
-    @staticmethod
-    def _resize_text_cell(tw, min_lines=1):
-        """
-        原生 tk.Text 用（子表 cell）。height 以行數計，configure 極快（~0.05ms）。
-        """
-        content = tw.get("1.0", "end-1c")
-        if not content.strip() or ('\n' not in content and len(content) <= 20):
-            last = getattr(tw, '_last_lines', min_lines)
-            if last != min_lines:
-                tw.configure(height=min_lines)
-                tw._last_lines = min_lines
-            return min_lines
-
-        try:
-            display_lines = int(tw.count("1.0", "end", "displaylines")[0])
-        except (TypeError, IndexError):
-            display_lines = max(1, content.count('\n') + 1)
-
-        target = max(min_lines, display_lines)
-        if target != getattr(tw, '_last_lines', -1):
-            tw.configure(height=target)
-            tw._last_lines = target
-        return target
-
-    def _auto_resize_row(self, row_frame, headers):
-        """計算行內最大高度並統一該行所有 text widget"""
-        max_lines = 1
-        text_cells = []
-        for col in headers:
-            widget = row_frame._widgets.get(col)
-            tw = widget[1] if isinstance(widget, tuple) else widget
-            if getattr(tw, '_is_text_cell', False):
-                lines = self._resize_text_cell(tw)
-                max_lines = max(max_lines, lines)
-                text_cells.append(tw)
-        if max_lines > 1:
-            for tw in text_cells:
-                if getattr(tw, '_last_lines', 1) != max_lines:
-                    tw.configure(height=max_lines)
-                    tw._last_lines = max_lines
-
-    @staticmethod
-    def _make_master_text_cell(parent, width=30):
-        """建立母表用的 tk.Text cell（取代 CTkTextbox，fill=x expand=True 佈局）"""
-        tw = tk.Text(parent, width=width, height=1, wrap="word",
-                     bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
-                     selectbackground=_CELL_FOCUS_BORDER, selectforeground="white",
-                     relief="flat", highlightthickness=1,
-                     highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
-                     font=_CELL_FONT, padx=4, pady=2, undo=False, maxundo=0)
-        tw._is_text_cell = True
-        tw._last_lines = 1
-        return tw
-
-    @staticmethod
-    def _make_text_cell(parent, width=15):
-        """建立輕量 tk.Text cell（取代 CTkTextbox，建立快 ~20x，configure 快 ~100x）"""
-        tw = tk.Text(parent, width=width, height=1, wrap="word",
-                     bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
-                     selectbackground=_CELL_FOCUS_BORDER, selectforeground="white",
-                     relief="flat", highlightthickness=1,
-                     highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
-                     font=_CELL_FONT, padx=4, pady=2, undo=False, maxundo=0)
-        tw._is_text_cell = True
-        tw._last_lines = 1
-        return tw
-
-    def _create_sub_table_row(self, parent, headers, row_data, row_idx, sheet_name, cols_cfg):
-        """創建新的資料行（當池中沒有可用行時）
-        使用 suppress-flag + mutable context 模式，避免 unbind/rebind 開銷。"""
-        row_frame = tk.Frame(parent, bg=_BG)
-
-        row_frame._widgets = {}
-        row_frame._vars = {}
-        row_frame._ctxs = {}  # mutable context dicts per column
-
-        # 刪除按鈕（原生 tk.Button）
-        del_ctx = {"suppress": False, "sheet": sheet_name, "row_idx": row_idx}
-        del_btn = tk.Button(row_frame, text="X", width=4,
-                            bg="darkred", fg="white", activebackground="#800000",
-                            activeforeground="white", relief="flat", cursor="hand2",
-                            font=("Segoe UI", 9),
-                            command=lambda c=del_ctx: self.delete_sub_item(c["sheet"], c["row_idx"]))
-        del_btn.pack(side="left", padx=2)
-        row_frame._widgets['delete_btn'] = del_btn
-        row_frame._del_ctx = del_ctx
-
-        # 資料欄位
-        for col in headers:
-            col_info = cols_cfg.get(col, {"type": "string"})
-            col_type = col_info.get("type", "string")
-            is_linked = col_info.get("link_to_text", False)
-
-            ctx = {"suppress": False, "sheet": sheet_name, "row_idx": row_idx, "col": col}
-            row_frame._ctxs[col] = ctx
-
-            if is_linked:
-                # Key (唯讀) — 原生 tk.Entry
-                key_entry = tk.Entry(row_frame, width=8,
-                                     bg=_CELL_BG, fg="gray",
-                                     disabledbackground=_CELL_BG, disabledforeground="gray",
-                                     relief="flat", font=_CELL_FONT, state="disabled")
-                key_entry.pack(side="left", padx=1)
-
-                # Text — 原生 tk.Text（輕量）
-                tw = self._make_text_cell(row_frame, width=15)
-                tw.pack(side="left", padx=1)
-
-                tw.bind("<KeyRelease>",
-                        lambda e, c=ctx, w=tw, rf=row_frame, h=headers:
-                        None if c["suppress"] else
-                        (self.manager.update_linked_text(c.get("key", ""), w.get("1.0", "end-1c")),
-                         self._auto_resize_row(rf, h)))
-
-                row_frame._widgets[col] = (key_entry, tw)
-                row_frame._vars[col] = None
-
-            elif col_type == "enum":
-                var = tk.StringVar()
-                options = col_info.get("options", ["None"])
-                menu = tk.OptionMenu(row_frame, var, *options,
-                                     command=lambda v, c=ctx:
-                                     None if c["suppress"] else
-                                     self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v))
-                menu.config(bg=_CELL_BG, fg=_CELL_FG,
-                            activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
-                            relief="flat", highlightthickness=0, font=_CELL_FONT, width=12)
-                menu["menu"].config(bg=_CELL_BG, fg=_CELL_FG,
-                                    activebackground=_CELL_FOCUS_BORDER, font=_CELL_FONT)
-                menu.pack(side="left", padx=2)
-                row_frame._widgets[col] = menu
-                row_frame._vars[col] = var
-
-            elif col_type == "bool":
-                var = tk.BooleanVar()
-                chk = tk.Checkbutton(row_frame, variable=var,
-                                     bg=_BG, activebackground=_BG, selectcolor=_CELL_BG, relief="flat",
-                                     command=lambda c=ctx, v=var:
-                                     None if c["suppress"] else
-                                     self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v.get()))
-                chk.pack(side="left", padx=2)
-                row_frame._widgets[col] = chk
-                row_frame._vars[col] = var
-
-            elif col_type in ("int", "float"):
-                var = tk.StringVar()
-                entry = tk.Entry(row_frame, textvariable=var, width=15,
-                                 bg=_CELL_BG, fg=_CELL_FG, insertbackground=_CELL_FG,
-                                 relief="flat", highlightthickness=1,
-                                 highlightbackground=_CELL_BORDER, highlightcolor=_CELL_FOCUS_BORDER,
-                                 font=_CELL_FONT)
-                entry.pack(side="left", padx=2)
-
-                var.trace_add("write",
-                              lambda *args, c=ctx, v=var:
-                              None if c["suppress"] else
-                              self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], v.get()))
-
-                row_frame._widgets[col] = entry
-                row_frame._vars[col] = var
-
-            else:  # string — 原生 tk.Text（輕量）
-                tw = self._make_text_cell(row_frame, width=15)
-                tw.pack(side="left", padx=2)
-
-                tw.bind("<KeyRelease>",
-                        lambda e, c=ctx, w=tw, rf=row_frame, h=headers:
-                        None if c["suppress"] else
-                        (self.manager.update_cell(True, c["sheet"], c["row_idx"], c["col"], w.get("1.0", "end-1c")),
-                         self._auto_resize_row(rf, h)))
-
-                row_frame._widgets[col] = tw
-                row_frame._vars[col] = None
-
-        # 綁定點擊選中行
-        def _on_row_click(event, rf=row_frame):
-            # 找到當前 tab name
-            try:
-                tab_name = self.sub_tables_tabs.get()
-            except:
-                return
-            self._select_sub_row(tab_name, rf)
-
-        row_frame.bind("<Button-1>", _on_row_click)
-        # 也綁定子 widget（避免點擊子元件時事件不冒泡）
-        for child in row_frame.winfo_children():
-            child.bind("<Button-1>", _on_row_click, add="+")
-
-        # 綁定雙擊跳轉引用（FK 欄位及其他可能的引用欄位）
-        for col in headers:
-            widget = row_frame._widgets.get(col)
-            if widget is None:
-                continue
-            # 取得實際可綁定的 widget
-            target_w = widget[0] if isinstance(widget, tuple) else widget
-            target_w.bind("<Double-Button-1>",
-                          lambda e, c=col, rf=row_frame: self._on_ref_double_click(c, rf))
-            # 如果是 tuple (key_entry, textbox)，也綁定 textbox
-            if isinstance(widget, tuple):
-                widget[1].bind("<Double-Button-1>",
-                               lambda e, c=col, rf=row_frame: self._on_ref_double_click(c, rf))
-
-        # 綁定右鍵選單
-        def _on_row_right_click(event, rf=row_frame, sn=sheet_name):
-            try:
-                tab_name = self.sub_tables_tabs.get()
-            except:
-                return
-            self._select_sub_row(tab_name, rf)
-            self._show_sub_row_context_menu(event, rf, sn)
-
-        row_frame.bind("<Button-3>", _on_row_right_click)
-        for child in row_frame.winfo_children():
-            child.bind("<Button-3>", _on_row_right_click, add="+")
-
-        # 填充初始數據
-        self._update_sub_table_row(row_frame, headers, row_data, row_idx, sheet_name, cols_cfg)
-
-        return row_frame
-
-    def _update_sub_table_row(self, row_frame, headers, row_data, row_idx, sheet_name, cols_cfg):
-        """更新資料行的內容（重用時調用）
-        使用 suppress-flag 模式：suppress=True → 注入值 → 更新 ctx → suppress=False
-        無需 unbind/rebind，Python 層開銷極小。"""
-
-        # 1. 更新刪除按鈕的 context
-        del_ctx = row_frame._del_ctx
-        del_ctx["sheet"] = sheet_name
-        del_ctx["row_idx"] = row_idx
-
-        # 2. 更新每個欄位的值（suppress 模式）
-        for col in headers:
-            val = row_data[col]
-            col_info = cols_cfg.get(col, {"type": "string"})
-            col_type = col_info.get("type", "string")
-            is_linked = col_info.get("link_to_text", False)
-
-            if col not in row_frame._widgets:
-                continue
-
-            ctx = row_frame._ctxs[col]
-            ctx["suppress"] = True
-
-            try:
-                if is_linked:
-                    key_entry, tw = row_frame._widgets[col]
-
-                    key_entry.configure(state="normal")
-                    key_entry.delete(0, "end")
-                    key_entry.insert(0, str(val))
-                    key_entry.configure(state="disabled")
-
-                    real_text = str(self.manager.get_text_value(val))
-                    tw.delete("1.0", "end")
-                    tw.insert("1.0", real_text)
-
-                    # 更新 ctx 中的 key（供 callback 讀取）
-                    ctx["key"] = str(val)
-
-                elif col_type == "enum":
-                    var = row_frame._vars[col]
-                    var.set(str(val))
-
-                elif col_type == "bool":
-                    var = row_frame._vars[col]
-                    var.set(bool(val) if val != "" else False)
-
-                elif col_type in ("int", "float"):
-                    var = row_frame._vars[col]
-                    var.set(str(val))
-
-                else:  # string (tk.Text cell)
-                    tw = row_frame._widgets[col]
-                    tw.delete("1.0", "end")
-                    tw.insert("1.0", str(val))
-
-            finally:
-                # 更新 context 指向新的 sheet/row_idx，然後解除 suppress
-                ctx["sheet"] = sheet_name
-                ctx["row_idx"] = row_idx
-                ctx["suppress"] = False
-
-        # 行高調整交由 _update_sub_table_data 批次處理
-
-    def _show_error_in_tab(self, tab_name, message):
-        """在 Tab 中顯示錯誤訊息"""
-        frames = self.sub_table_frames.get(tab_name)
-        if not frames:
+        tab_name = self._sub_tabs.tabText(self._sub_tabs.currentIndex())
+        full = self.table_name + "." + tab_name
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None:
             return
-
-        data_frame = frames['data']
-
-        # 清空內容
-        for widget in data_frame.winfo_children():
-            widget.pack_forget()
-
-        # 顯示錯誤 — 原生 tk.Label
-        tk.Label(data_frame, text=message, bg=_BG, fg="red", font=_CELL_FONT).pack(pady=20)
-
-    # ================== 跨表引用跳轉 ==================
-
-    def _on_ref_double_click(self, col, row_frame):
-        """雙擊子表欄位 → 查找是否為其他母表的 PK 並跳轉"""
-        ctx = row_frame._ctxs.get(col)
-        if not ctx:
+        df_idx = panel.selected_df_index()
+        if df_idx is None:
             return
-
-        # 取得當前 cell 的值
-        widget = row_frame._widgets.get(col)
-        if widget is None:
-            return
-        if isinstance(widget, tuple):
-            # linked field: key_entry 的值
-            key_entry = widget[0]
-            key_entry.configure(state="normal")
-            value = key_entry.get().strip()
-            key_entry.configure(state="disabled")
-        elif hasattr(widget, 'get') and callable(widget.get):
-            if isinstance(widget, tk.Text):
-                value = widget.get("1.0", "end-1c").strip()
-            else:
-                value = widget.get().strip()
-        else:
-            var = row_frame._vars.get(col)
-            value = str(var.get()).strip() if var else ""
-
-        if not value:
-            return
-
-        # 查找哪個母表的 PK 包含此值
-        for sheet_name, df in self.manager.master_dfs.items():
-            cfg = self.manager.config.get(sheet_name, {})
-            pk_key = cfg.get("primary_key", df.columns[0])
-            if pk_key in df.columns:
-                matches = df[df[pk_key].astype(str) == str(value)]
-                if not matches.empty:
-                    app = self.winfo_toplevel()
-                    if hasattr(app, '_jump_to_master'):
-                        app._jump_to_master(sheet_name, value)
-                    return
-
-    # ================== 右鍵選單 ==================
-
-    def _show_item_context_menu(self, event, row_idx):
-        """中間項目清單右鍵選單"""
-        self.load_editor(row_idx)
-        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
-                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
-                       font=_CELL_FONT)
-        menu.add_command(label="複製項目", command=self.copy_master_item)
-        menu.add_command(label="上移 \u25b2", command=lambda: self.move_master_item(-1))
-        menu.add_command(label="下移 \u25bc", command=lambda: self.move_master_item(1))
-        menu.add_separator()
-        menu.add_command(label="刪除", command=self.delete_master_item)
-        menu.post(event.x_root, event.y_root)
-
-    def _show_sub_row_context_menu(self, event, row_frame, sheet_name):
-        """子表行右鍵選單"""
-        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
-                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
-                       font=_CELL_FONT)
-        menu.add_command(label="複製行", command=self.copy_sub_item)
-        menu.add_command(label="上移 \u25b2", command=lambda: self.move_sub_item(-1))
-        menu.add_command(label="下移 \u25bc", command=lambda: self.move_sub_item(1))
-        menu.add_separator()
-
-        # 跳轉引用：讀取 FK 值
-        del_ctx = row_frame._del_ctx
-        sub_short = sheet_name.split("#")[1] if "#" in sheet_name else ""
-        sub_cfg = self.cfg.get("sub_sheets", {}).get(sub_short, {})
+        sub_cfg = self.cfg.get("sub_tables", {}).get(tab_name, {})
         fk_key = sub_cfg.get("foreign_key", self.pk_key)
-        # 嘗試取得 FK 欄位以外的可跳轉值
-        def _try_jump_ref():
-            for col, ctx in row_frame._ctxs.items():
-                widget = row_frame._widgets.get(col)
-                if widget is None:
-                    continue
-                if isinstance(widget, tuple):
-                    key_entry = widget[0]
-                    key_entry.configure(state="normal")
-                    val = key_entry.get().strip()
-                    key_entry.configure(state="disabled")
-                elif isinstance(widget, tk.Text):
-                    val = widget.get("1.0", "end-1c").strip()
-                elif hasattr(widget, 'get') and callable(widget.get):
-                    val = widget.get().strip()
-                else:
-                    var = row_frame._vars.get(col)
-                    val = str(var.get()).strip() if var else ""
-                if val:
-                    self._on_ref_double_click(col, row_frame)
-                    return
-
-        menu.add_command(label="跳轉引用", command=_try_jump_ref)
-        menu.add_separator()
-        menu.add_command(label="刪除",
-                         command=lambda: self.delete_sub_item(del_ctx["sheet"], del_ctx["row_idx"]))
-        menu.post(event.x_root, event.y_root)
-
-    def _show_cls_context_menu(self, event, cls_val):
-        """左側分類右鍵選單"""
-        self.load_items_by_group(cls_val)
-        menu = tk.Menu(self, tearoff=0, bg=_CELL_BG, fg=_CELL_FG,
-                       activebackground=_CELL_FOCUS_BORDER, activeforeground="white",
-                       font=_CELL_FONT)
-        menu.add_command(label="上移 \u25b2", command=lambda: self.move_classification(-1))
-        menu.add_command(label="下移 \u25bc", command=lambda: self.move_classification(1))
-        menu.add_separator()
-        menu.add_command(label="刪除", command=self.delete_classification)
-        menu.post(event.x_root, event.y_root)
-
-    def _open_batch_edit(self):
-        """切換批次編輯模式"""
-        if self._batch_mode:
-            self._exit_batch_mode()
+        siblings = list(sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)].index)
+        try:
+            pos = siblings.index(df_idx)
+        except ValueError:
             return
-
-        if not self.current_cls_val:
-            messagebox.showwarning("提示", "請先選擇一個分類")
+        new_pos = pos + delta
+        if new_pos < 0 or new_pos >= len(siblings):
             return
+        siblings[pos], siblings[new_pos] = siblings[new_pos], siblings[pos]
+        others = [i for i in sub_df.index if i not in siblings]
+        first = siblings[0] if siblings else 0
+        before = [i for i in others if i < first]
+        after  = [i for i in others if i > max(siblings)]
+        new_order = before + siblings + after
+        sub_df = sub_df.loc[new_order].reset_index(drop=True)
+        self.manager.sub_tables[full] = sub_df
+        self.manager.dirty = True
+        self._refresh_sub_tables()
 
-        self._batch_mode = True
-        self._batch_checks.clear()
+    def copy_sub_item(self):
+        panel = self._current_sub_panel()
+        if panel is None:
+            return
+        tab_name = self._sub_tabs.tabText(self._sub_tabs.currentIndex())
+        full = self.table_name + "." + tab_name
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None:
+            return
+        df_idx = panel.selected_df_index()
+        if df_idx is None:
+            return
+        new_row = sub_df.loc[df_idx].copy()
+        sub_df = pd.concat([sub_df, pd.DataFrame([new_row])], ignore_index=True)
+        self.manager.sub_tables[full] = sub_df
+        self.manager.dirty = True
+        self._refresh_sub_tables()
 
-        # 顯示批次工具列
-        if self._batch_bar:
-            self._batch_bar.destroy()
-        bar = ctk.CTkFrame(self.frame_mid, height=30, fg_color="#2a4a6b")
-        bar.pack(fill="x", padx=2, pady=(0, 2), before=self.scroll_items)
-        self._batch_bar = bar
+    # ── Context menus ─────────────────────────────────────────────────────────
 
-        ctk.CTkButton(bar, text="全選", width=45, height=24,
-                      command=self._batch_select_all).pack(side="left", padx=2)
-        ctk.CTkButton(bar, text="取消全選", width=60, height=24,
-                      command=self._batch_deselect_all).pack(side="left", padx=2)
-        ctk.CTkButton(bar, text="修改欄位", width=60, height=24, fg_color="green",
-                      command=self._batch_apply_dialog).pack(side="left", padx=2)
-        ctk.CTkButton(bar, text="完成", width=45, height=24, fg_color="gray",
-                      command=self._exit_batch_mode).pack(side="right", padx=2)
+    def _cls_ctx_menu(self, pos):
+        item = self._cls_list.itemAt(pos)
+        if item is None:
+            return
+        g = item.data(Qt.UserRole)
+        menu = QMenu(self)
+        menu.addAction("重新命名", lambda: self._rename_cls(g))
+        menu.addAction("刪除此分類", self.delete_classification)
+        menu.exec(self._cls_list.mapToGlobal(pos))
 
-        # 重建項目清單（帶勾選框）
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
-        self._rebuild_items_with_checks()
+    def _rename_cls(self, old_val):
+        new_val, ok = QInputDialog.getText(self, "重新命名", "新名稱:", text=str(old_val))
+        if not ok or not new_val.strip() or new_val.strip() == str(old_val):
+            return
+        self.df[self.cls_key] = self.df[self.cls_key].replace(old_val, new_val.strip())
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        if str(self.current_cls_val) == str(old_val):
+            self.current_cls_val = new_val.strip()
+        self._reload_all(select_cls=self.current_cls_val)
 
-    def _exit_batch_mode(self):
-        """退出批次編輯模式"""
-        self._batch_mode = False
-        self._batch_checks.clear()
-        if self._batch_bar:
-            self._batch_bar.destroy()
-            self._batch_bar = None
+    def _item_ctx_menu(self, pos):
+        item = self._item_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("複製",    self.copy_master_item)
+        menu.addAction("刪除",    self.delete_master_item)
+        menu.exec(self._item_list.mapToGlobal(pos))
 
-        # 重建正常項目清單
-        for btn in self.item_buttons.values():
-            btn.destroy()
-        self.item_buttons.clear()
+    # ── Refresh helpers ───────────────────────────────────────────────────────
+
+    def _reload_all(self, select_cls=None, select_idx=None):
+        """Reload df from manager, rebuild classification list, item list."""
+        self.df = self.manager.tables[self.table_name]
+        if select_cls is not None:
+            self.current_cls_val = select_cls
+        if select_idx is not None:
+            self.current_master_idx = select_idx
+        self._load_cls_list()
         if self.current_cls_val is not None:
-            self.load_items_by_group(self.current_cls_val)
+            self._load_item_list()
+        if self.current_master_idx is not None and self.current_master_idx in self.df.index:
+            self._load_editor(self.current_master_idx)
 
-    def _rebuild_items_with_checks(self):
-        """在批次模式下重建帶勾選框的項目清單"""
-        if not self.current_cls_val:
-            return
-        filter_df = self.df[self.df[self.cls_key] == self.current_cls_val]
+    def reload_after_config(self):
+        """Called after config changes to rebuild everything."""
+        self.cfg     = self.manager.config.get(self.table_name, {})
+        self.cls_key = self.cfg.get("classification_key",
+                       list(self.df.columns)[0] if len(self.df.columns) > 0 else "")
+        self.pk_key  = self.cfg.get("primary_key",
+                       list(self.df.columns)[0] if len(self.df.columns) > 0 else "")
+        # Destroy field panel so it rebuilds
+        if self._field_panel:
+            self._field_panel.deleteLater()
+            self._field_panel = None
+        self._build_sub_tabs()
+        self._reload_all()
 
-        for idx, row in filter_df.iterrows():
-            display_name = f"{row[self.pk_key]}"
-            if 'Name' in row.index and self.manager.text_dict:
-                text_dict_name = self.manager.text_dict.get(row['Name'])
-                if text_dict_name:
-                    display_name = text_dict_name["value"]
 
-            rf = tk.Frame(self.scroll_items.interior, bg=_BG)
-            rf.pack(fill="x", pady=1, padx=2)
+# ── WelcomeWidget ─────────────────────────────────────────────────────────────
 
-            var = tk.BooleanVar(value=False)
-            self._batch_checks[idx] = var
+class WelcomeWidget(QWidget):
+    open_file = Signal()
+    new_file  = Signal()
+    open_recent = Signal(str)
 
-            chk = tk.Checkbutton(rf, variable=var, bg=_BG,
-                                 activebackground=_BG, selectcolor=_CELL_BG)
-            chk.pack(side="left", padx=(2, 0))
-
-            lbl = tk.Label(rf, text=display_name, bg=_BG, fg=_CELL_FG,
-                           font=_CELL_FONT, anchor="w", cursor="hand2",
-                           wraplength=140)
-            lbl.pack(side="left", fill="x", expand=True, padx=4)
-
-            # 點擊 label 也切換勾選
-            lbl.bind("<Button-1>", lambda e, v=var: v.set(not v.get()))
-
-            self.item_buttons[idx] = rf
-
-    def _batch_select_all(self):
-        for var in self._batch_checks.values():
-            var.set(True)
-
-    def _batch_deselect_all(self):
-        for var in self._batch_checks.values():
-            var.set(False)
-
-    def _batch_apply_dialog(self):
-        """彈出欄位+值選擇視窗，套用到所有勾選項"""
-        selected = [idx for idx, var in self._batch_checks.items() if var.get()]
-        if not selected:
-            messagebox.showwarning("提示", "請先勾選至少一個項目")
-            return
-
-        BatchEditApplyWindow(self, selected)
-
-    def cleanup(self):
-        """清理資源"""
-        # suppress 所有 callback 防止 stale 呼叫
-        self._master_suppress = True
-
-        # 清理子表：suppress all contexts to prevent stale callbacks
-        for tab_name, active_rows in self.sub_table_active_rows.items():
-            for row_frame in active_rows:
-                for ctx in getattr(row_frame, '_ctxs', {}).values():
-                    ctx["suppress"] = True
-
-        # 清空所有緩存
-        self.cls_buttons.clear()
-        self.item_buttons.clear()
-        self.master_fields.clear()
-        self.master_field_vars.clear()
-        self.trace_ids.clear()
-        self.sub_table_frames.clear()
-        self.sub_table_headers.clear()
-        self.sub_table_row_pools.clear()
-        self.sub_table_active_rows.clear()
-        self.current_image_ref = None
-
-        # 銷毀所有子 widget
-        for widget in self.winfo_children():
-            widget.destroy()
-
-        import gc
-        gc.collect()
-
-    def destroy(self):
-        """重寫 destroy"""
-        self.cleanup()
-        super().destroy()
-
-class ConfigEditorWindow(ctk.CTkToplevel):
-    """配置設定視窗"""
-    def __init__(self, parent, manager):
+    def __init__(self, manager: JsonDataManager, parent=None):
         super().__init__(parent)
-        self.title("配置詳細設定")
-        self.manager = manager
-        self.grab_set()
-
-        # ===== 視窗 =====
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        win_w = int(screen_w * 0.60)
-        win_h = int(screen_h * 0.50)
-        self.geometry(f"{win_w}x{win_h}")
-        self.resizable(False, False)
-
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
-
-        # ========= Header =========
-        header = ctk.CTkFrame(self)
-        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
-        header.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            header,
-            text="偵測到資料表變動，請確認各表配置",
-            font=("微軟正黑體", 16, "bold")
-        ).grid(row=0, column=0, sticky="w", pady=(0, 5))
-
-        # ========= 圖片設定（固定在上方，不進 Scroll） =========
-        self.var_use_icon = ctk.BooleanVar(value=False)
-
-        # ========= 圖片與文字表設定 =========
-        # 將原本只有 Icon 的區塊擴充
-        setting_block = ctk.CTkFrame(header, fg_color="transparent")
-        setting_block.grid(row=1, column=0, sticky="w", pady=(0, 5))
-
-        # 1. 文字表路徑設定 (新增)
-        self.frame_text_path = ctk.CTkFrame(setting_block, fg_color="transparent")
-        self.frame_text_path.pack(anchor="w", padx=10, pady=2)
-        ctk.CTkLabel(self.frame_text_path, text="外部文字表路徑 (.xlsx):").pack(side="left")
-
-        self.entry_text_path = ctk.CTkEntry(self.frame_text_path, width=300)
-        self.entry_text_path.pack(side="left", padx=5)
-        self.entry_text_path.insert(0, self.manager.config.get("global_text_path", ""))
-
-        ctk.CTkButton(self.frame_text_path, text="瀏覽", width=50,
-                      command=self.browse_text_file).pack(side="left")
-
-        # 2. 圖片設定 (原本的)
-        self.var_use_icon = ctk.BooleanVar(value=False)
-        self.chk_use_icon = ctk.CTkCheckBox(
-            setting_block,
-            text="啟用圖示顯示 (需有 'Icon' 或 'Image' 欄位)",
-            variable=self.var_use_icon,
-            command=self.toggle_icon_input
-        )
-        self.chk_use_icon.pack(anchor="w", padx=10, pady=(10, 0))
-
-        self.frame_img_path = ctk.CTkFrame(setting_block, fg_color="transparent")
-        self.frame_img_path.pack(anchor="w", padx=30, pady=2)
-
-        ctk.CTkLabel(self.frame_img_path, text="圖片資料夾:").pack(side="left")
-        self.entry_img_path = ctk.CTkEntry(self.frame_img_path, width=300)
-        self.entry_img_path.pack(side="left", padx=5)
-        self.entry_img_path.bind("<KeyRelease>", self.on_image_path_change)
-
-        # ========= Tabs =========
-        center = ctk.CTkFrame(self)
-        center.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
-        center.grid_rowconfigure(0, weight=1)
-        center.grid_columnconfigure(0, weight=1)
-
-        self.tab_view = ctk.CTkTabview(
-            center,
-            command=self.on_tab_changed
-        )
-        self.tab_view.grid(row=0, column=0, sticky="nsew")
-
-        # ===== 初始化 config + Tabs =====
-        for sheet_name in self.manager.master_dfs.keys():
-            if sheet_name not in self.manager.config:
-                self.manager.config[sheet_name] = {
-                    "use_icon": False,
-                    "image_path": "",
-                    "classification_key": self.manager.master_dfs[sheet_name].classification_key,
-                    "primary_key": self.manager.master_dfs[sheet_name].primary_key,
-                    "columns": {
-                        col: {
-                            "type": "string",
-                            "link_to_text": False
-                        }
-                        for col in self.manager.master_dfs[sheet_name].columns
-                    },
-                    "sub_sheets": {}
-                }
-
-            tab = self.tab_view.add(sheet_name)
-            self.build_tab_content(tab, sheet_name)
-
-        self.after(10, self.sync_icon_setting_from_tab)
-
-        # ========= Footer =========
-        footer = ctk.CTkFrame(self)
-        footer.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
-
-        ctk.CTkButton(
-            footer,
-            text="儲存配置並刷新介面",
-            fg_color="#28a745",
-            hover_color="#218838",
-            command=self.save_and_close
-        ).pack(pady=5)
-
-    # ================== 圖片設定同步 ==================
-
-    def on_tab_changed(self):
-        self.sync_icon_setting_from_tab()
-
-    def sync_icon_setting_from_tab(self):
-        sheet = self.tab_view.get()
-        cfg = self.manager.config.get(sheet, {})
-
-        self.var_use_icon.set(cfg.get("use_icon", False))
-
-        self.entry_img_path.delete(0, "end")
-        self.entry_img_path.insert(0, cfg.get("image_path", ""))
-
-        self.toggle_icon_input()
-
-    def toggle_icon_input(self):
-        sheet = self.tab_view.get()
-        self.manager.config[sheet]["use_icon"] = self.var_use_icon.get()
-
-        if self.var_use_icon.get():
-            self.frame_img_path.pack(anchor="w", padx=30, pady=2)
-        else:
-            self.frame_img_path.pack_forget()
-
-    def on_image_path_change(self, event=None):
-        sheet = self.tab_view.get()
-        self.manager.config[sheet]["image_path"] = self.entry_img_path.get()
-
-    def browse_text_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-        if not path:
-            return
-
-        self.entry_text_path.delete(0, "end")
-        self.entry_text_path.insert(0, path)
-        self.manager.config["global_text_path"] = path
-
-        # 背景執行緒載入，避免大型文字表（多 sheet / 大量資料）凍結 UI
-        loading_win = ctk.CTkToplevel(self)
-        loading_win.title("")
-        loading_win.geometry("240x80")
-        loading_win.resizable(False, False)
-        loading_win.transient(self)
-        loading_win.grab_set()
-        ctk.CTkLabel(loading_win, text="載入文字表中，請稍候...",
-                     font=("微軟正黑體", 13)).pack(expand=True)
-        loading_win.update()
-
-        result_holder = []
-
-        def _do_load():
-            try:
-                result_holder.append(self.manager.load_external_text(path))
-            except Exception:
-                result_holder.append(False)
-            finally:
-                self.after(0, _on_done)
-
-        def _on_done():
-            try:
-                loading_win.destroy()
-            except Exception:
-                pass
-            if result_holder and result_holder[0]:
-                messagebox.showinfo("成功", "已載入外部文字表")
-            else:
-                messagebox.showerror("失敗", "載入失敗，請檢查格式")
-
-        threading.Thread(target=_do_load, daemon=True).start()
-
-    # ================== Tab 內容 ==================
-
-    def build_tab_content(self, tab, sheet_name):
-        main_scroll = LightScrollableFrame(tab)
-        main_scroll.pack(fill="both", expand=True)
-
-        cfg = self.manager.config[sheet_name]
-        all_cols = list(self.manager.master_dfs[sheet_name].columns)
-
-        # --- 母表設定 ---
-        base_frame = ctk.CTkFrame(main_scroll.interior)
-        base_frame.pack(fill="x", padx=5, pady=5)
-
-        ctk.CTkLabel(
-            base_frame,
-            text="母表分類參數 (Classification):",
-            font=("微軟正黑體", 12, "bold")
-        ).grid(row=0, column=0, padx=5, pady=5)
-
-        cls_menu = ctk.CTkOptionMenu(
-            base_frame,
-            values=all_cols,
-            command=lambda v: cfg.update({"classification_key": v})
-        )
-        cls_menu.set(cfg.get("classification_key", all_cols[0]))
-        cls_menu.grid(row=0, column=1, padx=5, pady=5)
-
-        # --- 母表欄位 ---
-        ctk.CTkLabel(
-            main_scroll.interior,
-            text="母表欄位類型設定",
-            font=("微軟正黑體", 13, "bold"),
-            text_color="#3B8ED0"
-        ).pack(pady=5)
-
-        for col in all_cols:
-            line = tk.Frame(main_scroll.interior, bg=_BG)
-            line.pack(fill="x", padx=20, pady=1)
-
-            ctk.CTkLabel(
-                line,
-                text=col,
-                width=150,
-                anchor="w"
-            ).pack(side="left")
-
-            # 確保 config 結構完整
-            if col not in cfg["columns"]:
-                cfg["columns"][col] = {
-                    "type": "string",
-                    "link_to_text": False
-                }
-            else:
-                cfg["columns"][col].setdefault("link_to_text", False)
-
-            # ---------- link_to_text 勾選 ----------
-            link_var = ctk.BooleanVar(
-                value=cfg["columns"][col]["link_to_text"]
-            )
-
-            def on_toggle_link(c=col, v=link_var):
-                cfg["columns"][c]["link_to_text"] = v.get()
-
-            ctk.CTkCheckBox(
-                line,
-                text="連結文字",
-                variable=link_var,
-                command=on_toggle_link
-            ).pack(side="right", padx=6)
-
-            # ---------- type 選單 ----------
-            t_menu = ctk.CTkOptionMenu(
-                line,
-                values=["string", "float", "int", "bool", "enum"],
-                width=100,
-                command=lambda v, c=col: self.set_col_type(sheet_name, c, v)
-            )
-            t_menu.set(cfg["columns"][col]["type"])
-            t_menu.pack(side="right")
-
-        # --- 子表 ---
-        related_subs = [s for s in self.manager.sub_dfs if s.startswith(sheet_name + "#")]
-        if related_subs:
-            ctk.CTkLabel(
-                main_scroll.interior,
-                text="子表欄位類型設定",
-                font=("微軟正黑體", 13, "bold"),
-                text_color="#E38D2D"
-            ).pack(pady=10)
-
-            for sub_full in related_subs:
-                short = sub_full.split("#")[1]
-                sub_group = ctk.CTkFrame(main_scroll.interior, border_width=1, border_color="gray")
-                sub_group.pack(fill="x", padx=10, pady=5)
-
-                ctk.CTkLabel(
-                    sub_group, text=f"子表: {short}",
-                    font=("微軟正黑體", 12, "bold")
-                ).pack(anchor="w", padx=5)
-
-                if short not in cfg["sub_sheets"]:
-                    cfg["sub_sheets"][short] = {
-                        "foreign_key": cfg["primary_key"],
-                        "columns": {}
-                    }
-
-                sub_cols = list(self.manager.sub_dfs[sub_full].columns)
-                for s_col in sub_cols:
-                    s_line = tk.Frame(sub_group, bg=_BG)
-                    s_line.pack(fill="x", padx=15, pady=1)
-
-                    ctk.CTkLabel(
-                        s_line, text=s_col, width=150, anchor="w"
-                    ).pack(side="left")
-
-                    if s_col not in cfg["sub_sheets"][short]["columns"]:
-                        cfg["sub_sheets"][short]["columns"][s_col] = {
-                            "type": "string",
-                            "link_to_text": False
-                        }
-                    else:
-                        cfg["sub_sheets"][short]["columns"][s_col].setdefault("link_to_text", False)
-
-                    # ---------- link_to_text 勾選 ----------
-                    link_var = ctk.BooleanVar(
-                        value=cfg["sub_sheets"][short]["columns"][s_col]["link_to_text"]
-                    )
-
-                    def on_toggle_link(c=s_col, v=link_var, s=short):
-                        cfg["sub_sheets"][s]["columns"][c]["link_to_text"] = v.get()
-
-                    ctk.CTkCheckBox(
-                        s_line,
-                        text="連結文字",
-                        variable=link_var,
-                        command=on_toggle_link
-                    ).pack(side="right", padx=6)
-
-                    # ---------- type 選單 ----------
-                    st_menu = ctk.CTkOptionMenu(
-                        s_line,
-                        values=["string", "float", "int", "bool", "enum"],
-                        width=100,
-                        command=lambda v, sn=short, sc=s_col: self.set_sub_col_type(sheet_name, sn, sc, v)
-                    )
-                    st_menu.set(cfg["sub_sheets"][short]["columns"][s_col]["type"])
-                    st_menu.pack(side="right")
-
-    # ================== Config 操作 ==================
-
-    def set_col_type(self, sheet_name, col, val):
-        self.manager.config[sheet_name]["columns"][col]["type"] = val
-        if val == "enum":
-            self._ask_enum_options(self.manager.config[sheet_name]["columns"][col])
-
-    def set_sub_col_type(self, m, s, col, val):
-        self.manager.config[m]["sub_sheets"][s]["columns"][col]["type"] = val
-        if val == "enum":
-            self._ask_enum_options(self.manager.config[m]["sub_sheets"][s]["columns"][col])
-
-    def _ask_enum_options(self, col_conf):
-        """彈出視窗讓使用者輸入 enum 選項（逗號分隔）"""
-        current = col_conf.get("options", [])
-        current_str = ", ".join(current) if current else ""
-
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("設定 Enum 選項")
-        dialog.geometry("400x150")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text="請輸入選項（以逗號分隔）：").pack(padx=10, pady=(10, 5), anchor="w")
-        var = ctk.StringVar(value=current_str)
-        entry = ctk.CTkEntry(dialog, textvariable=var, width=360)
-        entry.pack(padx=10, pady=5)
-        entry.focus_set()
-
-        def on_confirm():
-            raw = var.get().strip()
-            opts = [o.strip() for o in raw.split(",") if o.strip()] if raw else []
-            col_conf["options"] = opts
-            dialog.destroy()
-
-        entry.bind("<Return>", lambda e: on_confirm())
-        ctk.CTkButton(dialog, text="確認", command=on_confirm).pack(pady=10)
-
-    def save_and_close(self):
-        self.manager.save_config()
-        self.destroy()
-        if hasattr(self.master, "refresh_ui"):
-            self.master.refresh_ui()
-
-class SearchResultWindow(ctk.CTkToplevel):
-    """全域搜尋結果視窗（非模態，美化版）"""
-
-    _TAG_MASTER_BG = "#1a5c2a"  # 母表標籤底色（綠）
-    _TAG_SUB_BG = "#8b6914"     # 子表標籤底色（金）
-    _TAG_FG = "#ffffff"
-    _HOVER_BG = "#3a5070"       # 滑鼠懸停底色
-    _MATCH_FG = "#7ec8e3"       # 匹配值高亮色
-
-    def __init__(self, parent, results, jump_callback, query=""):
-        super().__init__(parent)
-        self.title("搜尋結果")
-        self.geometry("750x520")
-        self.transient(parent)
-
-        self._jump_callback = jump_callback
-
-        # ── 頂部標題列 ──
-        header = ctk.CTkFrame(self, fg_color="#333333", corner_radius=0)
-        header.pack(fill="x")
-        ctk.CTkLabel(header, text=f"  找到 {len(results)} 筆結果",
-                     font=("微軟正黑體", 14, "bold"),
-                     text_color="#7ec8e3").pack(side="left", padx=10, pady=8)
-        if query:
-            ctk.CTkLabel(header, text=f"關鍵字: {query}",
-                         font=("微軟正黑體", 11),
-                         text_color="#aaaaaa").pack(side="left", padx=10)
-        ctk.CTkButton(header, text="關閉", width=50, height=26,
-                      fg_color="gray", command=self.destroy).pack(side="right", padx=10, pady=6)
-
-        # ── 結果列表（CTkScrollableFrame — 一次性建立，非迴圈熱路徑） ──
-        scroll = ctk.CTkScrollableFrame(self, fg_color=_BG)
-        scroll.pack(fill="both", expand=True, padx=8, pady=(4, 8))
-
-        for i, (sheet_name, is_sub, row_idx, match_info) in enumerate(results):
-            row_bg = _ROW_EVEN if i % 2 == 0 else _ROW_ODD
-
-            rf = tk.Frame(scroll, bg=row_bg, cursor="hand2",
-                          highlightthickness=1, highlightbackground="#444444")
-            rf.pack(fill="x", pady=2, padx=4, ipady=3)
-
-            # 標籤 (母表/子表)
-            if is_sub:
-                tag_text, tag_bg = "子表", self._TAG_SUB_BG
-            else:
-                tag_text, tag_bg = "母表", self._TAG_MASTER_BG
-
-            tag_lbl = tk.Label(rf, text=f" {tag_text} ", bg=tag_bg, fg=self._TAG_FG,
-                               font=("微軟正黑體", 9, "bold"), padx=4, pady=1)
-            tag_lbl.pack(side="left", padx=(6, 4), pady=2)
-
-            # 表名
-            sheet_display = sheet_name.replace("#", " > ") if "#" in sheet_name else sheet_name
-            tk.Label(rf, text=sheet_display, bg=row_bg, fg="#b0b0b0",
-                     font=("微軟正黑體", 10), anchor="w").pack(side="left", padx=(0, 8))
-
-            # 匹配內容（最多 2 組 col=val）
-            match_strs = []
-            for col, val in list(match_info.items())[:2]:
-                display_val = val if len(val) <= 40 else val[:37] + "..."
-                match_strs.append(f"{col}={display_val}")
-
-            tk.Label(rf, text="  |  ".join(match_strs), bg=row_bg,
-                     fg=self._MATCH_FG, font=_CELL_FONT, anchor="w").pack(
-                side="left", fill="x", expand=True, padx=4)
-
-            # 行號
-            tk.Label(rf, text=f"#{row_idx}", bg=row_bg, fg="#777777",
-                     font=("Segoe UI", 9)).pack(side="right", padx=(4, 8))
-
-            # hover 效果 + 點擊
-            def _enter(e, f=rf):
-                f.configure(bg=self._HOVER_BG)
-                for w in f.winfo_children():
-                    try:
-                        w.configure(bg=self._HOVER_BG)
-                    except tk.TclError:
-                        pass
-
-            def _leave(e, f=rf, bg=row_bg):
-                f.configure(bg=bg)
-                for w in f.winfo_children():
-                    try:
-                        # tag label 保持原色
-                        if getattr(w, '_is_tag', False):
-                            pass
-                        else:
-                            w.configure(bg=bg)
-                    except tk.TclError:
-                        pass
-
-            def _on_click(e, s=sheet_name, sub=is_sub, idx=row_idx):
-                self._jump_callback(s, sub, idx)
-
-            tag_lbl._is_tag = True  # 標記不被 hover 改色
-
-            for w in [rf] + rf.winfo_children():
-                w.bind("<Enter>", _enter)
-                w.bind("<Leave>", _leave)
-                w.bind("<Button-1>", _on_click)
-
-
-class BatchEditApplyWindow(ctk.CTkToplevel):
-    """批次編輯 — 選擇欄位與新值（勾選模式觸發）"""
-    def __init__(self, parent_editor, selected_indices):
-        super().__init__(parent_editor.winfo_toplevel())
-        self.title("批次修改")
-        self.geometry("400x180")
-        self.transient(parent_editor.winfo_toplevel())
-        self.grab_set()
-
-        self.editor = parent_editor
-        self.selected = selected_indices
-
-        ctk.CTkLabel(self, text=f"將修改 {len(selected_indices)} 筆項目",
-                     font=("微軟正黑體", 13, "bold")).pack(pady=(10, 5))
-
-        # 目標欄位
-        field_frame = ctk.CTkFrame(self, fg_color="transparent")
-        field_frame.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(field_frame, text="目標欄位:").pack(side="left")
-        cols = list(parent_editor.df.columns)
-        self.col_var = ctk.StringVar(value=cols[0] if cols else "")
-        ctk.CTkOptionMenu(field_frame, values=cols, variable=self.col_var).pack(
-            side="left", padx=10, fill="x", expand=True)
-
-        # 新的值
-        val_frame = ctk.CTkFrame(self, fg_color="transparent")
-        val_frame.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(val_frame, text="新的值:").pack(side="left")
-        self.val_entry = ctk.CTkEntry(val_frame)
-        self.val_entry.pack(side="left", padx=10, fill="x", expand=True)
-        self.val_entry.bind("<Return>", lambda e: self._apply())
-
-        # 按鈕
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(pady=10)
-        ctk.CTkButton(btn_frame, text="套用", fg_color="green",
-                      command=self._apply).pack(side="left", padx=10)
-        ctk.CTkButton(btn_frame, text="取消", fg_color="gray",
-                      command=self.destroy).pack(side="left", padx=10)
-
-    def _apply(self):
-        col = self.col_var.get()
-        value = self.val_entry.get()
-        if not col:
-            return
-
-        editor = self.editor
-        manager = editor.manager
-
-        for idx in self.selected:
-            manager.update_cell(False, editor.sheet_name, idx, col, value)
-        manager.dirty = True
-
-        self.destroy()
-
-        # 退出批次模式並刷新
-        editor._exit_batch_mode()
-        if editor.current_master_idx is not None:
-            editor.load_editor(editor.current_master_idx)
-
-
-class App(ctk.CTk):
-    """ 主畫面 """
+        self._manager = manager
+        self._setup_ui()
+
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setAlignment(Qt.AlignCenter)
+
+        card = QWidget()
+        card.setFixedWidth(420)
+        card.setStyleSheet("background:#1a1a2e; border-radius:8px;")
+        lo = QVBoxLayout(card)
+        lo.setContentsMargins(36, 32, 36, 32)
+        lo.setSpacing(8)
+
+        logo = QLabel("{ }")
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setStyleSheet("font-family:Consolas; font-size:40px; font-weight:bold; color:#7ec8e3; background:transparent;")
+        lo.addWidget(logo)
+
+        title = QLabel("JsonEditor")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size:18px; font-weight:bold; color:#c8ccd4; background:transparent;")
+        lo.addWidget(title)
+
+        subtitle = QLabel("輕量 JSON 資料編輯器")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("color:#44446a; background:transparent;")
+        lo.addWidget(subtitle)
+
+        lo.addSpacing(20)
+
+        btn_row = QHBoxLayout()
+        b_open = _accent_btn("📂  開啟 JSON", "blue")
+        b_new  = QPushButton("📄  新建 JSON")
+        b_open.setFixedHeight(36)
+        b_new.setFixedHeight(36)
+        b_open.clicked.connect(self.open_file)
+        b_new.clicked.connect(self.new_file)
+        btn_row.addWidget(b_open)
+        btn_row.addWidget(b_new)
+        lo.addLayout(btn_row)
+
+        recent = self._manager._recent_files
+        if recent:
+            lo.addSpacing(16)
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet("background:#2a2a4a; max-height:1px;")
+            lo.addWidget(sep)
+            lo.addSpacing(4)
+
+            hdr = QLabel("最近開啟")
+            hdr.setStyleSheet("color:#44446a; background:transparent;")
+            lo.addWidget(hdr)
+
+            for path in recent[:6]:
+                fname = os.path.basename(path)
+                dirn  = os.path.dirname(path)
+                row   = QWidget()
+                row.setStyleSheet(
+                    "QWidget { background:transparent; border-radius:3px; }"
+                    "QWidget:hover { background:#1e2040; }"
+                )
+                row.setCursor(Qt.PointingHandCursor)
+                rlo = QHBoxLayout(row)
+                rlo.setContentsMargins(4, 4, 4, 4)
+                lbl_fn = QLabel(fname)
+                lbl_fn.setStyleSheet("color:#8888cc; font-weight:bold; background:transparent;")
+                lbl_dir = QLabel(dirn)
+                lbl_dir.setStyleSheet("color:#333355; background:transparent;")
+                lbl_dir.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                rlo.addWidget(lbl_fn)
+                rlo.addWidget(lbl_dir, 1)
+                row.mousePressEvent = lambda e, p=path: self.open_recent.emit(p)
+                lo.addWidget(row)
+
+        outer.addWidget(card)
+
+    def refresh(self, manager):
+        self._manager = manager
+        # Rebuild UI
+        while self.layout().count():
+            item = self.layout().takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._setup_ui()
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title("Game Data Editor (Config Driven)")
-        icon_path = os.path.join(getattr(sys, '_MEIPASS', os.path.abspath(".")), "icon.ico")
-        if os.path.exists(icon_path):
-            self.iconbitmap(icon_path)
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
+        self.setWindowTitle("JsonEditor")
+        self.resize(1200, 750)
+        self.manager = JsonDataManager()
+        self._editors: dict[str, TableEditor | None] = {}
+        self._snackbar_timer = QTimer(self)
+        self._snackbar_timer.setSingleShot(True)
+        self._snackbar_timer.timeout.connect(lambda: self._status_lbl.setText("就緒"))
 
-        win_w = int(screen_w * 0.75)
-        win_h = int(screen_h * 0.75)
+        self._setup_toolbar()
+        self._setup_statusbar()
+        self._setup_content()
 
-        self.geometry(f"{win_w}x{win_h}")
-        # self.geometry("1280x720")
+        # Keyboard shortcuts
+        QAction(parent=self, shortcut=QKeySequence("Ctrl+S"), triggered=self.save_file).setEnabled(True)
+        self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+S"), triggered=self.save_file))
+        self.addAction(QAction(parent=self, shortcut=QKeySequence("Ctrl+O"), triggered=self.load_file))
 
-        self.manager = DataManager()
+        self._show_welcome()
 
-        # 初始化暗色捲軸主題
-        _init_dark_scrollbar_style()
+    # ── Toolbar ───────────────────────────────────────────────────────────────
 
-        # 頂部操作列
-        self.top_bar = ctk.CTkFrame(self, height=40)
-        self.top_bar.pack(fill="x", padx=5, pady=5)
+    def _setup_toolbar(self):
+        tb = QToolBar("main", self)
+        tb.setMovable(False)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(tb)
 
-        ctk.CTkButton(self.top_bar, text="讀取 Excel", command=self.load_file).pack(side="left", padx=5)
-        ctk.CTkButton(self.top_bar, text="儲存 Excel", command=self.save_file, fg_color="green").pack(side="left", padx=5)
-        ctk.CTkButton(self.top_bar, text="搜尋", width=60, command=self._show_search_bar).pack(side="left", padx=5)
-        ctk.CTkButton(self.top_bar, text="配置設定", command=self.open_configwnd, fg_color="gray").pack(side="right", padx=5)
+        logo = QLabel("{ } JsonEditor")
+        logo.setStyleSheet("font-family:Consolas; font-size:13px; font-weight:bold; color:#7ec8e3; padding:0 14px;")
+        tb.addWidget(logo)
+        tb.addSeparator()
 
-        # === 搜尋列 (Ctrl+F) ===
-        self.search_bar = ctk.CTkFrame(self, height=38, fg_color="#1e3a52",
-                                       border_width=1, border_color="#3B8ED0")
-        self._search_visible = False
+        def _act(icon, text, shortcut, slot):
+            a = QAction(f"{icon}  {text}", self)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            a.triggered.connect(slot)
+            tb.addAction(a)
+            return a
 
-        sf = self.search_bar
-        ctk.CTkLabel(sf, text="  \U0001f50d", font=("Segoe UI", 13)).pack(side="left", padx=(6, 2))
-        self._search_var = ctk.StringVar()
-        self._search_entry = ctk.CTkEntry(sf, textvariable=self._search_var, width=320,
-                                          height=28, placeholder_text="輸入關鍵字搜尋所有表...")
-        self._search_entry.pack(side="left", padx=4)
-        self._search_entry.bind("<Return>", lambda e: self._perform_search())
-        ctk.CTkButton(sf, text="搜尋", width=60, height=28,
-                      command=self._perform_search).pack(side="left", padx=4)
-        ctk.CTkButton(sf, text="\u2715", width=28, height=28, fg_color="#555555",
-                      hover_color="#777777", command=self._hide_search_bar).pack(side="left", padx=2)
-        ctk.CTkLabel(sf, text="Ctrl+F", font=("Segoe UI", 9),
-                     text_color="#666666").pack(side="right", padx=10)
+        _act("📂", "開啟", "Ctrl+O", self.load_file)
+        self._act_save = _act("💾", "儲存", "Ctrl+S", self.save_file)
+        tb.addSeparator()
+        _act("🔍", "搜尋", "Ctrl+F", self._show_search)
+        _act("⚙",  "配置", "",       self.open_config)
+        tb.addSeparator()
+        _act("🕓", "最近", "", self._show_recent_menu)
 
-        self.bind_all("<Control-f>", lambda e: self._show_search_bar())
-        self._search_entry.bind("<Escape>", lambda e: self._hide_search_bar())
+    # ── Status bar ────────────────────────────────────────────────────────────
 
-        # 內容區 (Tabview 存放不同的母表)
-        self.main_tabs = ctk.CTkTabview(self, command=self._on_main_tab_changed)
-        self.main_tabs.pack(fill="both", expand=True, padx=5, pady=5)
+    def _setup_statusbar(self):
+        sb = self.statusBar()
+        self._status_lbl = QLabel("就緒")
+        self._dirty_lbl  = QLabel("")
+        self._path_lbl   = QLabel("")
+        self._path_lbl.setStyleSheet("color:#333355;")
+        sb.addWidget(self._status_lbl, 1)
+        sb.addPermanentWidget(self._path_lbl)
+        sb.addPermanentWidget(self._dirty_lbl)
 
-        self.sheet_editors = []
-        self._editor_map = {}  # {sheet_name: SheetEditor or None} 延遲載入追蹤
-        # 全域滑鼠滾輪路由 (根據游標位置決定捲動目標)
-        self.bind_all("<MouseWheel>", self._route_mousewheel)
-        self.bind_all("<Shift-MouseWheel>", self._route_shift_mousewheel)
+    def show_snackbar(self, text, duration_ms=3000, color="#7ec8e3"):
+        self._status_lbl.setText(text)
+        self._status_lbl.setStyleSheet(f"color:{color};")
+        self._snackbar_timer.start(duration_ms)
 
-        # 關閉視窗攔截
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+    def _on_snackbar_done(self):
+        self._status_lbl.setText("就緒")
+        self._status_lbl.setStyleSheet("")
 
-    def _on_close(self):
-        """關閉視窗前檢查未儲存的變更"""
-        if self.manager.dirty:
-            result = messagebox.askyesnocancel("資料未儲存", "有尚未儲存的變更，是否先儲存再關閉？")
-            if result is None:  # Cancel
-                return
-            if result:  # Yes
-                self.save_file()
-        self.destroy()
+    # ── Content ───────────────────────────────────────────────────────────────
+
+    def _setup_content(self):
+        self._stack = QStackedWidget(self)
+        self.setCentralWidget(self._stack)
+
+        self._welcome = WelcomeWidget(self.manager)
+        self._welcome.open_file.connect(self.load_file)
+        self._welcome.new_file.connect(self._new_file)
+        self._welcome.open_recent.connect(self._load_recent)
+        self._stack.addWidget(self._welcome)
+
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setDocumentMode(True)
+        self._tab_widget.currentChanged.connect(self._on_tab_changed)
+        self._stack.addWidget(self._tab_widget)
+
+    def _show_welcome(self):
+        self._stack.setCurrentWidget(self._welcome)
+
+    def _show_editor(self):
+        self._stack.setCurrentWidget(self._tab_widget)
+
+    # ── File I/O ──────────────────────────────────────────────────────────────
 
     def load_file(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
+        last_dir = os.path.dirname(self.manager._full_config.get("_last_file", "")) or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "開啟 JSON", last_dir, "JSON 檔案 (*.json);;所有檔案 (*.*)")
+        if path:
+            self._load_path(path)
+
+    def _new_file(self):
+        import json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "新建 JSON", "", "JSON 檔案 (*.json)")
         if not path:
             return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([], f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, "錯誤", str(e))
+            return
+        self._load_path(path)
 
-        # 建立載入中提示視窗（不阻塞事件迴圈）
-        loading_win = ctk.CTkToplevel(self)
-        loading_win.title("")
-        loading_win.geometry("240x80")
-        loading_win.resizable(False, False)
-        loading_win.transient(self)
-        loading_win.grab_set()
-        ctk.CTkLabel(loading_win, text="載入中，請稍候...",
-                     font=("微軟正黑體", 13)).pack(expand=True)
-        loading_win.update()
+    def _load_recent(self, path):
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "錯誤", f"找不到檔案：\n{path}")
+            self.manager._recent_files = [p for p in self.manager._recent_files if p != path]
+            self.manager.save_config()
+            return
+        self._load_path(path)
 
-        error_holder = []
+    def _load_path(self, path):
+        import sys
+        self._set_loading(True, f"載入 {os.path.basename(path)}…")
+        orig_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.001)   # 1ms GIL switch → main thread stays alive
 
-        def _do_load():
-            try:
-                self.manager.load_excel(path)
-            except Exception as e:
-                error_holder.append(str(e))
-            finally:
-                self.after(0, _on_done)
+        worker = _LoadWorker(self.manager, path)
+        self._active_worker = worker
 
         def _on_done():
-            try:
-                loading_win.destroy()
-            except Exception:
-                pass
-            if error_holder:
-                messagebox.showerror("錯誤", f"讀取失敗: {error_holder[0]}")
-                return
-            if self.manager.need_config_alert:
-                messagebox.showinfo("提示", "偵測到新資料表，請先設定【分類參數】與【欄位格式】")
-                self.open_configwnd()
-            else:
-                self.refresh_ui()
+            sys.setswitchinterval(orig_interval)
+            self._active_worker = None
+            self._set_loading(False)
+            self._refresh_ui()
+            # Remember last file
+            self.manager._full_config["_last_file"] = path
+            self.manager.save_config()
 
-        threading.Thread(target=_do_load, daemon=True).start()
+        def _on_error(msg):
+            sys.setswitchinterval(orig_interval)
+            self._active_worker = None
+            self._set_loading(False)
+            QMessageBox.critical(self, "載入失敗", msg)
+
+        worker.done.connect(_on_done)
+        worker.error.connect(_on_error)
+        worker.start()
+
+    def _set_loading(self, loading: bool, msg: str = "就緒"):
+        self.setEnabled(not loading)
+        self._status_lbl.setText(msg)
+        self._status_lbl.setStyleSheet("color:#7ec8e3;" if loading else "")
+        QApplication.processEvents()   # flush UI before heavy work begins
 
     def save_file(self):
-        # 建立儲存中提示視窗
-        loading_win = ctk.CTkToplevel(self)
-        loading_win.title("")
-        loading_win.geometry("240x80")
-        loading_win.resizable(False, False)
-        loading_win.transient(self)
-        loading_win.grab_set()
-        ctk.CTkLabel(loading_win, text="儲存中，請稍候...",
-                     font=("微軟正黑體", 13)).pack(expand=True)
-        loading_win.update()
+        if not self.manager.json_path:
+            QMessageBox.warning(self, "提示", "尚未載入任何 JSON 檔案")
+            return
 
-        error_holder = []
+        import sys
+        self._set_loading(True, "儲存中…")
+        orig_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.001)
 
-        def _do_save():
-            try:
-                self.manager.save_excel()
-            except Exception as e:
-                error_holder.append(str(e))
-            finally:
-                self.after(0, _on_done)
+        worker = _SaveWorker(self.manager)
+        self._active_worker = worker
 
         def _on_done():
-            try:
-                loading_win.destroy()
-            except Exception:
-                pass
-            if error_holder:
-                messagebox.showerror("存檔失敗", error_holder[0])
-            else:
-                messagebox.showinfo("成功", "存檔完成")
+            sys.setswitchinterval(orig_interval)
+            self._active_worker = None
+            self._set_loading(False)
+            self.show_snackbar("✓ 已儲存", color="#4ec87a")
+            self._update_title()
 
-        threading.Thread(target=_do_save, daemon=True).start()
+        def _on_error(msg):
+            sys.setswitchinterval(orig_interval)
+            self._active_worker = None
+            self._set_loading(False)
+            QMessageBox.critical(self, "存檔失敗", msg)
 
-    def refresh_ui(self):
-        # 1. 先清理舊的 SheetEditor
-        for editor in self.sheet_editors:
-            editor.destroy()
-        self.sheet_editors = []
-        self._editor_map = {}
+        worker.done.connect(_on_done)
+        worker.error.connect(_on_error)
+        worker.start()
 
-        # 2. 差異更新 Tabs（保留 CTkTabview 實例，避免重建開銷）
-        existing_tabs = set(self.main_tabs._tab_dict.keys())
-        needed_tabs = set(self.manager.master_dfs.keys())
-
-        # 移除不需要的 tab
-        for tab_name in (existing_tabs - needed_tabs):
-            self.main_tabs.delete(tab_name)
-
-        # 新增需要的 tab（只建立 tab 按鈕，不建立 Editor 內容）
-        sheet_names = list(self.manager.master_dfs.keys())
-        for sheet_name in sheet_names:
-            if sheet_name not in existing_tabs:
-                self.main_tabs.add(sheet_name)
-            self._editor_map[sheet_name] = None  # 標記為尚未建立
-
-        # 3. 只建立第一個（當前可見的）tab 的 Editor，其餘延遲到切換時
-        if sheet_names:
-            self._ensure_editor(sheet_names[0])
-
-    def _on_main_tab_changed(self):
-        """頂部 Tab 切換時，延遲建立尚未初始化的 SheetEditor"""
-        current = self.main_tabs.get()
-        if current:
-            self._ensure_editor(current)
-
-    def _ensure_editor(self, sheet_name):
-        """確保指定 tab 的 SheetEditor 已建立（只建立一次）"""
-        if self._editor_map.get(sheet_name) is not None:
-            return  # 已建立，跳過
-
-        parent = self.main_tabs.tab(sheet_name)
-        editor = SheetEditor(parent, sheet_name, self.manager)
-        editor.pack(fill="both", expand=True)
-        self._editor_map[sheet_name] = editor
-        self.sheet_editors.append(editor)
-
-    def open_configwnd(self):
-        if not self.manager.master_dfs:
-            messagebox.showinfo("提示", "請先匯入Excel後再進行參數的配置")
+    def _show_recent_menu(self):
+        recent = self.manager._recent_files
+        if not recent:
+            self.show_snackbar("沒有最近開啟的檔案")
             return
-        _ = ConfigEditorWindow(self, self.manager)
+        menu = QMenu(self)
+        for path in recent:
+            fname = os.path.basename(path)
+            menu.addAction(f"{fname}  —  {os.path.dirname(path)}",
+                           lambda p=path: self._load_recent(p))
+        menu.addSeparator()
+        menu.addAction("清除記錄", self._clear_recent)
+        menu.exec(self.mapToGlobal(self.rect().topLeft()))
 
-    # ================== 搜尋功能 ==================
+    def _clear_recent(self):
+        self.manager._recent_files = []
+        self.manager.save_config()
+        self.show_snackbar("已清除最近記錄")
 
-    def _show_search_bar(self):
-        if not self._search_visible:
-            self.search_bar.pack(after=self.top_bar, fill="x", padx=5, pady=(0, 2))
-            self._search_visible = True
-        self._search_entry.focus_set()
-        self._search_entry.select_range(0, "end")
+    def _try_restore_last_file(self):
+        """Auto-reopen last file on startup if it still exists."""
+        last = self.manager._full_config.get("_last_file", "")
+        if last and os.path.isfile(last):
+            self._load_path(last)
 
-    def _hide_search_bar(self):
-        if self._search_visible:
-            self.search_bar.pack_forget()
-            self._search_visible = False
-        self._search_var.set("")
+    # ── UI refresh ────────────────────────────────────────────────────────────
 
-    def _perform_search(self):
-        query = self._search_var.get().strip()
-        if not query:
-            return
+    def _refresh_ui(self):
+        self._tab_widget.blockSignals(True)
+        self._tab_widget.clear()
+        self._editors.clear()
 
-        results = []
-        limit = 200
+        tables = list(self.manager.tables.keys())
+        for tname in tables:
+            self._editors[tname] = None
+            self._tab_widget.addTab(QWidget(), tname)
 
-        # 搜尋母表
-        for sheet_name, df in self.manager.master_dfs.items():
-            if len(results) >= limit:
-                break
-            try:
-                mask = df.astype(str).apply(
-                    lambda col: col.str.contains(query, case=False, na=False))
-                matched = mask.any(axis=1)
-                for idx in df[matched].index:
-                    if len(results) >= limit:
-                        break
-                    matched_cols = {col: str(df.at[idx, col])
-                                    for col in df.columns if mask.at[idx, col]}
-                    results.append((sheet_name, False, idx, matched_cols))
-            except Exception:
-                pass
+        self._tab_widget.blockSignals(False)
 
-        # 搜尋子表
-        for sub_name, sub_df in self.manager.sub_dfs.items():
-            if len(results) >= limit:
-                break
-            try:
-                mask = sub_df.astype(str).apply(
-                    lambda col: col.str.contains(query, case=False, na=False))
-                matched = mask.any(axis=1)
-                for idx in sub_df[matched].index:
-                    if len(results) >= limit:
-                        break
-                    matched_cols = {col: str(sub_df.at[idx, col])
-                                    for col in sub_df.columns if mask.at[idx, col]}
-                    results.append((sub_name, True, idx, matched_cols))
-            except Exception:
-                pass
-
-        # 搜尋連結文字
-        if self.manager.text_dict and len(results) < limit:
-            for key, info in self.manager.text_dict.items():
-                if len(results) >= limit:
-                    break
-                val = info["value"] if isinstance(info, dict) else str(info)
-                if query.lower() in val.lower() or query.lower() in str(key).lower():
-                    # 找到哪個母表行引用此 key
-                    for sheet_name, df in self.manager.master_dfs.items():
-                        for col in df.columns:
-                            col_mask = df[col].astype(str) == str(key)
-                            for idx in df[col_mask].index:
-                                if len(results) >= limit:
-                                    break
-                                results.append((sheet_name, False, idx,
-                                                {col: str(key), "Text": val}))
-
-        if not results:
-            messagebox.showinfo("搜尋", f"找不到「{query}」")
-            return
-
-        SearchResultWindow(self, results, self._jump_to_result, query=query)
-
-    def _jump_to_result(self, sheet_name, is_sub, row_idx):
-        """跳轉到搜尋結果"""
-        if is_sub:
-            # 子表結果：取得母表名 + FK 值 → 跳轉母表
-            parts = sheet_name.split("#")
-            master_sheet = parts[0]
-            sub_short = parts[1] if len(parts) > 1 else ""
-
-            sub_df = self.manager.sub_dfs.get(sheet_name)
-            if sub_df is None or row_idx not in sub_df.index:
-                return
-
-            # 找 FK
-            cfg = self.manager.config.get(master_sheet, {})
-            sub_cfg = cfg.get("sub_sheets", {}).get(sub_short, {})
-            pk_key = cfg.get("primary_key", "")
-            fk_key = sub_cfg.get("foreign_key", pk_key)
-
-            if fk_key in sub_df.columns:
-                fk_val = str(sub_df.at[row_idx, fk_key])
-                self._jump_to_master(master_sheet, fk_val)
+        if tables:
+            self._show_editor()
+            # Defer editor build to after the event loop paints the empty tabs
+            QTimer.singleShot(0, lambda: self._ensure_editor(0))
         else:
-            # 母表結果：直接跳轉
-            if sheet_name not in self.manager.master_dfs:
-                return
-            df = self.manager.master_dfs[sheet_name]
-            if row_idx not in df.index:
-                return
+            self._welcome.refresh(self.manager)
+            self._show_welcome()
 
-            # 切換 tab
-            self.main_tabs.set(sheet_name)
-            self._ensure_editor(sheet_name)
-            editor = self._editor_map.get(sheet_name)
-            if not editor:
-                return
+        self._update_title()
+        self.show_snackbar(f"已載入 {len(tables)} 個資料表", color="#7ec8e3")
 
-            # 找到該行的分類
-            cls_val = df.at[row_idx, editor.cls_key]
-            editor.load_items_by_group(cls_val)
-            editor.load_editor(row_idx)
+    def _on_tab_changed(self, idx):
+        self._ensure_editor(idx)
 
-    def _jump_to_master(self, sheet_name, pk_value):
-        """跳轉到指定母表的指定 PK 項目"""
-        if sheet_name not in self.manager.master_dfs:
+    def _ensure_editor(self, idx):
+        if idx < 0 or idx >= self._tab_widget.count():
             return
-
-        df = self.manager.master_dfs[sheet_name]
-        self.main_tabs.set(sheet_name)
-        self._ensure_editor(sheet_name)
-        editor = self._editor_map.get(sheet_name)
-        if not editor:
+        tname = self._tab_widget.tabText(idx)
+        if self._editors.get(tname) is not None:
             return
+        editor = TableEditor(tname, self.manager)
+        editor.status_message.connect(self.show_snackbar)
+        self._editors[tname] = editor          # set BEFORE tab swap to guard re-entrant signal
+        # Replace placeholder widget
+        self._tab_widget.blockSignals(True)
+        self._tab_widget.removeTab(idx)
+        self._tab_widget.insertTab(idx, editor, tname)
+        self._tab_widget.blockSignals(False)
+        self._tab_widget.setCurrentIndex(idx)
 
-        # 找到 PK 對應的行
-        matches = df[df[editor.pk_key].astype(str) == str(pk_value)]
-        if matches.empty:
-            messagebox.showinfo("跳轉", f"找不到 {pk_value}")
+    def _update_title(self):
+        if self.manager.json_path:
+            fname = os.path.basename(self.manager.json_path)
+            dirty = " *" if self.manager.dirty else ""
+            self.setWindowTitle(f"JsonEditor — {fname}{dirty}")
+            self._dirty_lbl.setText("● 未儲存" if self.manager.dirty else "✓ 已儲存")
+            self._dirty_lbl.setStyleSheet(
+                f"color:{'#e0a040' if self.manager.dirty else '#3a9e6a'};")
+            self._path_lbl.setText(self.manager.json_path)
+        else:
+            self.setWindowTitle("JsonEditor")
+            self._dirty_lbl.setText("")
+            self._path_lbl.setText("")
+
+    # ── Search ────────────────────────────────────────────────────────────────
+
+    def _show_search(self):
+        query, ok = QInputDialog.getText(self, "搜尋", "搜尋所有資料表:")
+        if not ok or not query.strip():
             return
-
-        row_idx = matches.index[0]
-        cls_val = df.at[row_idx, editor.cls_key]
-        editor.load_items_by_group(cls_val)
-        editor.load_editor(row_idx)
-
-    def _route_mousewheel(self, event):
-        """將滑鼠滾輪事件路由到游標所在的可捲動區域"""
-        widget = self.winfo_containing(event.x_root, event.y_root)
-        if not widget:
+        results = self.manager.search_index(query.strip())
+        if not results:
+            self.show_snackbar("無結果")
             return
-        scroll_units = int(-1 * (event.delta / 120))
-        w = widget
-        while w:
-            # 子表 Canvas
-            if getattr(w, '_is_sub_table_canvas', False):
-                top, bottom = w.yview()
-                if bottom - top < 1.0:
-                    w.yview_scroll(scroll_units, "units")
-                return "break"
-            # LightScrollableFrame 的內部 Canvas
-            if getattr(w, '_is_light_scrollable', False):
-                top, bottom = w.yview()
-                if bottom - top < 1.0:
-                    w.yview_scroll(scroll_units, "units")
-                return "break"
-            # CTkScrollableFrame (備用相容)
-            if isinstance(w, ctk.CTkScrollableFrame):
-                w._parent_canvas.yview_scroll(scroll_units, "units")
-                return "break"
-            try:
-                w = w.master
-            except:
+        # Jump to first result
+        tname, is_sub, row_idx, _cols = results[0]
+        if is_sub:
+            return
+        for i in range(self._tab_widget.count()):
+            if self._tab_widget.tabText(i) == tname:
+                self._tab_widget.setCurrentIndex(i)
+                self._ensure_editor(i)
+                editor = self._editors.get(tname)
+                if editor:
+                    df = self.manager.tables[tname]
+                    cls_val = df.at[row_idx, editor.cls_key]
+                    editor.current_cls_val = cls_val
+                    editor._load_cls_list()
+                    editor._load_item_list()
+                    editor._load_editor(row_idx)
                 break
+        self.show_snackbar(f"找到 {len(results)} 筆結果 (已跳至第一筆)")
 
-    def _route_shift_mousewheel(self, event):
-        """將 Shift+滑鼠滾輪事件路由到游標所在的子表 Canvas (橫向捲動)"""
-        widget = self.winfo_containing(event.x_root, event.y_root)
-        if not widget:
+    # ── Config ────────────────────────────────────────────────────────────────
+
+    def open_config(self):
+        idx = self._tab_widget.currentIndex()
+        if idx < 0:
             return
-        scroll_units = int(-1 * (event.delta / 120))
-        w = widget
-        while w:
-            if getattr(w, '_is_sub_table_canvas', False):
-                w.xview_scroll(scroll_units, "units")
-                return "break"
-            # 支援在 header 區域也能觸發水平捲動 (找到相鄰的 data canvas)
-            if getattr(w, '_is_sub_table_header_canvas', False):
-                w._linked_data_canvas.xview_scroll(scroll_units, "units")
-                return "break"
-            try:
-                w = w.master
-            except:
-                break
+        tname = self._tab_widget.tabText(idx)
+        if tname not in self.manager.tables:
+            return
+        self._show_config_dialog(tname)
+
+    def _show_config_dialog(self, table_name):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QScrollArea
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"配置 — {table_name}")
+        dlg.setMinimumWidth(480)
+        dlg.setStyleSheet(APP_STYLE)
+
+        cfg = self.manager.config.get(table_name, {})
+        df  = self.manager.tables[table_name]
+        cols = list(df.columns)
+
+        outer = QVBoxLayout(dlg)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        form = QFormLayout(content)
+        form.setContentsMargins(12, 12, 12, 12)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        pk_var  = QComboBox(); pk_var.addItems(cols)
+        cls_var = QComboBox(); cls_var.addItems(cols)
+        pk_var.setCurrentText(cfg.get("primary_key", cols[0] if cols else ""))
+        cls_var.setCurrentText(cfg.get("classification_key", cols[0] if cols else ""))
+        form.addRow("Primary Key:", pk_var)
+        form.addRow("Classification Key:", cls_var)
+
+        form.addRow(_sep_frame(), QLabel())
+        form.addRow(QLabel("欄位類型:"), QLabel())
+
+        col_type_combos = {}
+        cols_cfg = cfg.get("columns", {})
+        for col in cols:
+            cb = QComboBox()
+            cb.addItems(["string", "int", "float", "bool", "enum"])
+            cb.setCurrentText(cols_cfg.get(col, {}).get("type", "string"))
+            form.addRow(f"  {col}:", cb)
+            col_type_combos[col] = cb
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        outer.addWidget(bb)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        # Apply
+        cfg["primary_key"]        = pk_var.currentText()
+        cfg["classification_key"] = cls_var.currentText()
+        if "columns" not in cfg:
+            cfg["columns"] = {}
+        for col, cb in col_type_combos.items():
+            if col not in cfg["columns"]:
+                cfg["columns"][col] = {}
+            cfg["columns"][col]["type"] = cb.currentText()
+        self.manager.config[table_name] = cfg
+        self.manager.save_config()
+
+        editor = self._editors.get(table_name)
+        if editor:
+            editor.reload_after_config()
+        self.show_snackbar("配置已套用", color="#7ec8e3")
+
+    # ── Window close ──────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        if self.manager.dirty:
+            ans = QMessageBox.question(
+                self, "未儲存變更", "有未儲存的變更，是否儲存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
+            )
+            if ans == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.Save:
+                self.save_file()
+        event.accept()
+
+
+# ── Entry ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLE)
+    window = App()
+    window.show()
+    sys.exit(app.exec())
