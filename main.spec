@@ -28,18 +28,17 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# one-dir: EXE 本身不自解壓，避免 SAC / SmartScreen 封鎖
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,   # binaries 放進 COLLECT，不打包進 EXE
     name='JsonEditor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -47,4 +46,13 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='JsonEditor',       # 輸出到 dist/JsonEditor/ 資料夾
 )
