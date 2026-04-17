@@ -1503,32 +1503,52 @@ class TableEditor(QWidget):
     # ── Item list (card list) ─────────────────────────────────────────────────
 
     def _load_item_list(self):
-        query = self._filter_edit.text().strip().lower()
+        query    = self._filter_edit.text().strip().lower()
         self._card_list.blockSignals(True)
         self._card_list.clear()
         if self.current_cls_val is None or self.pk_key not in self.df.columns:
             self._card_list.blockSignals(False)
             return
 
-        sub_df = self.df[self.df[self.cls_key] == self.current_cls_val]
-
-        # Determine subtitle column
-        sub_col = next(
+        sub_df   = self.df[self.df[self.cls_key] == self.current_cls_val]
+        sub_col  = next(
             (c for c in self.df.columns if c != self.pk_key and c != self.cls_key),
             None
         )
 
+        # Build text-ref resolver for display
+        cols_cfg = self.cfg.get("columns", {})
+        _trs     = self.cfg.get("text_ref_source", {})
+        _trs_json = _trs.get("json_path", "")
+        _trs_key  = _trs.get("key_col", "TextID")
+        _trs_val  = _trs.get("val_col", "TextContent")
+        if _trs_json and self.manager.json_path:
+            _json_dir = os.path.dirname(self.manager.json_path)
+            _abs_ref  = os.path.join(_json_dir, _trs_json) if not os.path.isabs(_trs_json) else _trs_json
+        else:
+            _abs_ref  = ""
+
+        def _disp(col, raw):
+            if _abs_ref and cols_cfg.get(col, {}).get("type") == "text_ref":
+                resolved = self.manager.get_ref_text(_abs_ref, _trs_key, str(raw), _trs_val)
+                return resolved if resolved else str(raw)
+            return str(raw)
+
         for df_idx, row in sub_df.iterrows():
-            pk_val   = str(row[self.pk_key])
-            subtitle = str(row[sub_col]) if sub_col else ""
-            if query and query not in pk_val.lower() and query not in subtitle.lower():
+            pk_raw   = str(row[self.pk_key])
+            sub_raw  = str(row[sub_col]) if sub_col else ""
+            pk_disp  = _disp(self.pk_key, pk_raw)
+            sub_disp = _disp(sub_col, sub_raw) if sub_col else ""
+
+            if query and query not in pk_raw.lower() and query not in pk_disp.lower() \
+                     and query not in sub_raw.lower() and query not in sub_disp.lower():
                 continue
 
             item = QListWidgetItem()
-            item.setData(Qt.UserRole,                   df_idx)
-            item.setData(ItemCardDelegate.R_PK,         pk_val)
-            item.setData(ItemCardDelegate.R_SUB,        subtitle)
-            item.setData(ItemCardDelegate.R_CAT,        str(self.current_cls_val))
+            item.setData(Qt.UserRole,            df_idx)
+            item.setData(ItemCardDelegate.R_PK,  pk_disp)
+            item.setData(ItemCardDelegate.R_SUB, sub_disp)
+            item.setData(ItemCardDelegate.R_CAT, str(self.current_cls_val))
             self._card_list.addItem(item)
             if df_idx == self.current_master_idx:
                 self._card_list.setCurrentItem(item)
