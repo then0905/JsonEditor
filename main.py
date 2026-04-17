@@ -451,10 +451,12 @@ def _update_img_thumb(path_str: str, label: "QLabel", base_dir: "str | None") ->
     p = path_str if os.path.isabs(path_str) else (
         os.path.join(base_dir, path_str) if base_dir else path_str
     )
+    p = os.path.normpath(p)
     px = QPixmap(p)
     if px.isNull():
         label.setPixmap(QPixmap())
-        label.setText("Image not found")
+        label.setText(f"找不到圖片:\n{p}")
+        label.setWordWrap(True)
     else:
         label.setText("")
         w = label.width() or 220
@@ -741,9 +743,10 @@ class FieldEditorWidget(QWidget):
         self._col_types     = {}
         self._lbl_widgets   = {}   # col → QLabel (the col name label)
         self._bool_updaters = {}   # col → update_style(checked: bool)
-        self._img_preview_label: "QLabel | None" = None  # table-level image preview
-        self._img_col:          str = ""   # which column holds the image filename
-        self._img_base_folder:  str = ""   # configured base folder for images
+        self._img_preview_label:  "QLabel | None" = None  # table-level image preview
+        self._img_path_segments:  list = []  # [{"type":"col","col":"X"} | {"type":"lit","value":"Y"}]
+        self._img_base_folder:    str  = ""  # configured base folder for images
+        self._img_ext:            str  = ""  # file extension appended to assembled path e.g. ".png"
         self._text_ref_json:    str = ""   # table-level external text-ref JSON path
         self._text_ref_key_col: str = "TextID"
         self._text_ref_val_col: str = "TextContent"
@@ -779,9 +782,10 @@ class FieldEditorWidget(QWidget):
         self._col_types.clear()
         self._lbl_widgets.clear()
         self._bool_updaters.clear()
-        self._img_preview_label = None  # cleared by layout wipe above
-        self._img_col           = ""
-        self._img_base_folder   = ""
+        self._img_preview_label  = None  # cleared by layout wipe above
+        self._img_path_segments  = []
+        self._img_base_folder    = ""
+        self._img_ext            = ""
         self._text_ref_json     = ""
         self._text_ref_key_col  = "TextID"
         self._text_ref_val_col  = "TextContent"
@@ -790,21 +794,31 @@ class FieldEditorWidget(QWidget):
         self._manager    = manager
         cols_cfg  = cfg.get("columns", {})
         _img_cfg  = cfg.get("image_preview", {})
-        img_col   = _img_cfg.get("col", "")
-        self._img_col          = img_col if (img_col and img_col in df.columns) else ""
         self._img_base_folder  = _img_cfg.get("base_folder", "")
+        self._img_ext          = _img_cfg.get("ext", "")
+        _segs = _img_cfg.get("path_segments", [])
+        if not _segs:
+            # backward compat: old single "col" key
+            _old_col = _img_cfg.get("col", "")
+            if _old_col and _old_col in df.columns:
+                _segs = [{"type": "col", "col": _old_col}]
+        self._img_path_segments = _segs
         _trs = cfg.get("text_ref_source", {})
         self._text_ref_json    = _trs.get("json_path", "")
         self._text_ref_key_col = _trs.get("key_col", "TextID")   or "TextID"
         self._text_ref_val_col = _trs.get("val_col", "TextContent") or "TextContent"
 
         # ── Table-level image preview (shown at top if configured) ─────────────
-        if self._img_col:
+        if self._img_path_segments:
+            _seg_desc = "/".join(
+                s.get("col", "?") if s.get("type") == "col" else s.get("value", "?")
+                for s in self._img_path_segments
+            )
             prev_card = QWidget()
             prev_card.setStyleSheet(f"background:{_C['panel']};")
             pclo = QVBoxLayout(prev_card)
             pclo.setContentsMargins(14, 10, 14, 6); pclo.setSpacing(4)
-            lbl_img = QLabel(f"● IMAGE  [{img_col}]")
+            lbl_img = QLabel(f"● IMAGE  [{_seg_desc}]")
             lbl_img.setStyleSheet(
                 f"color:{_C['txt3']}; font-size:10px; font-weight:600; "
                 f"letter-spacing:1px; background:transparent;"
@@ -1054,9 +1068,16 @@ class FieldEditorWidget(QWidget):
                 w.blockSignals(False)
 
         # Update table-level image preview
-        if self._img_col and self._img_preview_label:
+        if self._img_path_segments and self._img_preview_label:
             try:
-                img_val = str(row_data[self._img_col])
+                parts = []
+                for _seg in self._img_path_segments:
+                    if _seg.get("type") == "col":
+                        _c = _seg.get("col", "")
+                        parts.append(str(row_data[_c]) if _c and _c in row_data.index else "")
+                    else:
+                        parts.append(_seg.get("value", ""))
+                img_val = "/".join(parts) + self._img_ext
             except Exception:
                 img_val = ""
             # Resolve base: configured folder first, else JSON dir
@@ -1247,7 +1268,6 @@ class TableEditor(QWidget):
             ("▲",       "ghost",   lambda: self.move_master_item(-1)),
             ("▼",       "ghost",   lambda: self.move_master_item(1)),
             ("刪除",    "danger",  self.delete_master_item),
-            ("⊞ 欄位", "ghost",   self.add_master_column),
         ]:
             b = _mk_btn(text, role)
             b.setFixedHeight(32)
@@ -1281,14 +1301,25 @@ class TableEditor(QWidget):
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
 
-        # Panel header (item ID)
-        self._panel_hdr = QLabel("  — 請選擇項目 —")
-        self._panel_hdr.setFixedHeight(44)
-        self._panel_hdr.setStyleSheet(
-            f"background: {_C['panel']}; border-bottom: 1px solid {_C['border']}; "
-            f"color: {_C['txt2']}; font-size: 13px; font-weight: 500; padding: 0 14px;"
+        # Panel header (item ID) + ⊞ 欄位 button
+        _ph_widget = QWidget()
+        _ph_widget.setFixedHeight(44)
+        _ph_widget.setStyleSheet(
+            f"background: {_C['panel']}; border-bottom: 1px solid {_C['border']};"
         )
-        rv.addWidget(self._panel_hdr)
+        _ph_lo = QHBoxLayout(_ph_widget)
+        _ph_lo.setContentsMargins(14, 0, 8, 0)
+        _ph_lo.setSpacing(6)
+        self._panel_hdr = QLabel("— 請選擇項目 —")
+        self._panel_hdr.setStyleSheet(
+            f"color: {_C['txt2']}; font-size: 13px; font-weight: 500; background: transparent;"
+        )
+        _col_btn = _mk_btn("⊞ 欄位", "ghost")
+        _col_btn.setFixedHeight(28)
+        _col_btn.clicked.connect(self.add_master_column)
+        _ph_lo.addWidget(self._panel_hdr, 1)
+        _ph_lo.addWidget(_col_btn)
+        rv.addWidget(_ph_widget)
 
         # Right splitter: field editor (top) / sub-tables (bottom)
         rsplit = QSplitter(Qt.Vertical)
@@ -1588,11 +1619,10 @@ class TableEditor(QWidget):
 
         # Update panel header
         cat = _cat_for(str(self.current_cls_val))
-        self._panel_hdr.setText(f"  {self.current_master_pk}")
+        self._panel_hdr.setText(f"{self.current_master_pk}")
         self._panel_hdr.setStyleSheet(
-            f"background:{_C['panel']}; border-bottom:1px solid {_C['border']}; "
             f"color:{cat['text']}; font-family:Consolas; font-size:13px; "
-            f"font-weight:700; padding:0 14px;"
+            f"font-weight:700; background:transparent;"
         )
 
         if self._field_panel is None:
@@ -2504,13 +2534,7 @@ class App(QMainWindow):
         vlo.addWidget(_form_row("Primary Key",         pk_var))
         vlo.addWidget(_form_row("Classification Key",  cls_var))
 
-        img_cols = ["（無）"] + cols
-        img_var  = _NoscrollCombo(); img_var.addItems(img_cols)
-        cur_img  = cfg.get("image_preview", {}).get("col", "")
-        img_var.setCurrentText(cur_img if cur_img in cols else "（無）")
-        vlo.addWidget(_form_row("Image Preview 欄位", img_var))
-
-        # Image base folder row: [edit] [Browse folder]
+        # ── Browse helper (used by image folder + text-ref) ──────────────────
         def _browse_row(edit, is_folder=False):
             row = QWidget(); row.setStyleSheet("background:transparent;")
             rl = QHBoxLayout(row); rl.setContentsMargins(0,0,0,0); rl.setSpacing(4)
@@ -2535,9 +2559,89 @@ class App(QMainWindow):
             rl.addWidget(edit, 1); rl.addWidget(btn)
             return row
 
+        # Image base folder (first row)
         img_folder_edit = QLineEdit(cfg.get("image_preview", {}).get("base_folder", ""))
         img_folder_edit.setPlaceholderText("圖片根目錄（相對路徑或絕對路徑）")
         vlo.addWidget(_form_row("Image 資料夾路徑", _browse_row(img_folder_edit, is_folder=True)))
+
+        img_ext_edit = QLineEdit(cfg.get("image_preview", {}).get("ext", ""))
+        img_ext_edit.setPlaceholderText("副檔名，例如 .png")
+        vlo.addWidget(_form_row("Image 副檔名", img_ext_edit))
+
+        # ── Image path segments builder (second row) ───────────────────────────
+        _img_segs_container = QWidget(); _img_segs_container.setStyleSheet("background:transparent;")
+        _img_segs_lo = QVBoxLayout(_img_segs_container)
+        _img_segs_lo.setContentsMargins(0, 0, 0, 0); _img_segs_lo.setSpacing(2)
+        _img_segs_rows = []  # list of (type_cb, val_stack, col_combo, lit_edit, row_w)
+
+        _img_rows_lo = QVBoxLayout()
+        _img_segs_lo.addLayout(_img_rows_lo)
+
+        def _add_img_seg_row(seg_type="col", seg_value=""):
+            row_w = QWidget(); row_w.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(row_w); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(4)
+            type_cb = _NoscrollCombo()
+            type_cb.addItems(["欄位", "字串"])
+            type_cb.setFixedWidth(58)
+            col_combo = _NoscrollCombo()
+            col_combo.addItems(cols)
+            lit_edit = QLineEdit()
+            lit_edit.setPlaceholderText("字串值")
+            val_stack = QStackedWidget()
+            val_stack.setStyleSheet("background:transparent;")
+            val_stack.addWidget(col_combo)   # index 0
+            val_stack.addWidget(lit_edit)    # index 1
+            if seg_type == "lit":
+                type_cb.setCurrentIndex(1)
+                val_stack.setCurrentIndex(1)
+                lit_edit.setText(seg_value)
+            else:
+                type_cb.setCurrentIndex(0)
+                val_stack.setCurrentIndex(0)
+                if seg_value in cols:
+                    col_combo.setCurrentText(seg_value)
+            type_cb.currentIndexChanged.connect(val_stack.setCurrentIndex)
+            del_btn = QPushButton("−")
+            del_btn.setFixedSize(24, 24)
+            del_btn.setStyleSheet(
+                f"background:{_C['card']}; border:1px solid {_C['border']}; "
+                f"color:{_C['red']}; border-radius:4px; font-weight:700;"
+            )
+            rl.addWidget(type_cb)
+            rl.addWidget(val_stack, 1)
+            rl.addWidget(del_btn)
+            entry = (type_cb, val_stack, col_combo, lit_edit, row_w)
+            _img_segs_rows.append(entry)
+            _img_rows_lo.addWidget(row_w)
+            def _del_seg(e=entry, w=row_w):
+                if e in _img_segs_rows:
+                    _img_segs_rows.remove(e)
+                w.hide()
+                w.deleteLater()
+            del_btn.clicked.connect(_del_seg)
+
+        # Load existing segments (backward compat with old "col" key)
+        _cur_img_segs = cfg.get("image_preview", {}).get("path_segments", [])
+        if not _cur_img_segs:
+            _old_img_col = cfg.get("image_preview", {}).get("col", "")
+            if _old_img_col:
+                _cur_img_segs = [{"type": "col", "col": _old_img_col}]
+        for _s in _cur_img_segs:
+            if _s.get("type") == "col":
+                _add_img_seg_row("col", _s.get("col", ""))
+            else:
+                _add_img_seg_row("lit", _s.get("value", ""))
+
+        _add_seg_btn = QPushButton("＋ 加段")
+        _add_seg_btn.setFixedHeight(26)
+        _add_seg_btn.setStyleSheet(
+            f"background:{_C['card']}; border:1px solid {_C['border']}; "
+            f"color:{_C['txt2']}; border-radius:5px; font-size:11px;"
+        )
+        _add_seg_btn.clicked.connect(lambda: _add_img_seg_row("col", ""))
+        _img_segs_lo.addWidget(_add_seg_btn)
+
+        vlo.addWidget(_form_row("Image 路徑結構", _img_segs_container))
 
         # External text-ref JSON path row
         _trs_cfg = cfg.get("text_ref_source", {})
@@ -2632,12 +2736,20 @@ class App(QMainWindow):
         # ── Apply ─────────────────────────────────────────────────────────────
         cfg["primary_key"]        = pk_var.currentText()
         cfg["classification_key"] = cls_var.currentText()
-        img_col_val    = img_var.currentText()
         img_folder_val = img_folder_edit.text().strip()
-        if img_col_val and img_col_val != "（無）":
-            cfg["image_preview"] = {"col": img_col_val}
+        _new_segs = []
+        for (tcb, vstk, ccb, ledit, rw) in _img_segs_rows:
+            if tcb.currentIndex() == 0:
+                _new_segs.append({"type": "col", "col": ccb.currentText()})
+            else:
+                _new_segs.append({"type": "lit", "value": ledit.text()})
+        img_ext_val = img_ext_edit.text().strip()
+        if _new_segs:
+            cfg["image_preview"] = {"path_segments": _new_segs}
             if img_folder_val:
                 cfg["image_preview"]["base_folder"] = img_folder_val
+            if img_ext_val:
+                cfg["image_preview"]["ext"] = img_ext_val
         else:
             cfg.pop("image_preview", None)
 
