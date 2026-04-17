@@ -21,6 +21,8 @@ class JsonDataManager:
         self.dirty_cells = set()   # {(table_name, row_idx, col_name)}
         self._recent_files = self._full_config.get("_recent_files", [])
         self._search_index = {}   # {table_name: {token: set of (table_name, row_idx)}}
+        self._ref_cache    = {}   # {norm_abs_path: [list of row dicts]}
+        self._ref_dict     = {}   # {(norm_abs_path, key_col, val_col): {key_str: val_str}}
 
     # ──────────────────────────────────────────────
     # Config I/O
@@ -100,6 +102,54 @@ class JsonDataManager:
             if matched:
                 results.append((table_name, is_sub, row_idx, matched))
         return results
+
+    # ──────────────────────────────────────────────
+    # Text reference lookup (for text_ref column type)
+    # ──────────────────────────────────────────────
+
+    def get_ref_text(self, ref_json_abs: str, ref_key: str, key_val, ref_val: str) -> str:
+        norm     = os.path.normpath(ref_json_abs)
+        dict_key = (norm, ref_key, ref_val)
+
+        if dict_key not in self._ref_dict:
+            # Load raw rows if not yet loaded
+            if norm not in self._ref_cache:
+                try:
+                    with open(norm, 'r', encoding='utf-8-sig') as f:
+                        raw = json.load(f)
+                    if isinstance(raw, list):
+                        rows = [r for r in raw if isinstance(r, dict)]
+                    elif isinstance(raw, dict):
+                        rows = []
+                        for v in raw.values():
+                            if isinstance(v, list):
+                                rows = [r for r in v if isinstance(r, dict)]
+                                break
+                    else:
+                        rows = []
+                    self._ref_cache[norm] = rows
+                except Exception:
+                    self._ref_cache[norm] = []
+
+            # Build lookup dict: {str(key_col_value): str(val_col_value)}
+            rows = self._ref_cache[norm]
+            self._ref_dict[dict_key] = {
+                str(row[ref_key]): str(row[ref_val])
+                for row in rows
+                if ref_key in row and ref_val in row
+            }
+
+        return self._ref_dict[dict_key].get(str(key_val), "")
+
+    def invalidate_ref_cache(self, ref_json_abs: str | None = None) -> None:
+        if ref_json_abs is None:
+            self._ref_cache.clear()
+            self._ref_dict.clear()
+        else:
+            norm = os.path.normpath(ref_json_abs)
+            self._ref_cache.pop(norm, None)
+            for k in [k for k in self._ref_dict if k[0] == norm]:
+                del self._ref_dict[k]
 
     # ──────────────────────────────────────────────
     # Load

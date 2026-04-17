@@ -439,6 +439,29 @@ class _SaveWorker(QThread):
             self.error.emit(str(e))
 
 
+# ── Image thumbnail helper ────────────────────────────────────────────────────
+
+def _update_img_thumb(path_str: str, label: "QLabel", base_dir: "str | None") -> None:
+    """Load an image into a QLabel thumbnail, resolving relative paths."""
+    from PySide6.QtGui import QPixmap
+    if not path_str:
+        label.setPixmap(QPixmap())
+        label.setText("No Image")
+        return
+    p = path_str if os.path.isabs(path_str) else (
+        os.path.join(base_dir, path_str) if base_dir else path_str
+    )
+    px = QPixmap(p)
+    if px.isNull():
+        label.setPixmap(QPixmap())
+        label.setText("Image not found")
+    else:
+        label.setText("")
+        w = label.width() or 220
+        h = label.height() or 90
+        label.setPixmap(px.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+
 # ── Non-scroll ComboBox (used in config dialog) ───────────────────────────────
 
 class _NoscrollCombo(QComboBox):
@@ -718,6 +741,13 @@ class FieldEditorWidget(QWidget):
         self._col_types     = {}
         self._lbl_widgets   = {}   # col → QLabel (the col name label)
         self._bool_updaters = {}   # col → update_style(checked: bool)
+        self._img_preview_label: "QLabel | None" = None  # table-level image preview
+        self._img_col:          str = ""   # which column holds the image filename
+        self._img_base_folder:  str = ""   # configured base folder for images
+        self._text_ref_json:    str = ""   # table-level external text-ref JSON path
+        self._text_ref_key_col: str = "TextID"
+        self._text_ref_val_col: str = "TextContent"
+        self._ref_labels    = {}   # col → QLabel (resolved lookup text for "text_ref" type)
         self._row_idx     = None
         self._table_name  = None
         self._manager     = None
@@ -749,9 +779,49 @@ class FieldEditorWidget(QWidget):
         self._col_types.clear()
         self._lbl_widgets.clear()
         self._bool_updaters.clear()
+        self._img_preview_label = None  # cleared by layout wipe above
+        self._img_col           = ""
+        self._img_base_folder   = ""
+        self._text_ref_json     = ""
+        self._text_ref_key_col  = "TextID"
+        self._text_ref_val_col  = "TextContent"
+        self._ref_labels.clear()
         self._table_name = table_name
         self._manager    = manager
-        cols_cfg         = cfg.get("columns", {})
+        cols_cfg  = cfg.get("columns", {})
+        _img_cfg  = cfg.get("image_preview", {})
+        img_col   = _img_cfg.get("col", "")
+        self._img_col          = img_col if (img_col and img_col in df.columns) else ""
+        self._img_base_folder  = _img_cfg.get("base_folder", "")
+        _trs = cfg.get("text_ref_source", {})
+        self._text_ref_json    = _trs.get("json_path", "")
+        self._text_ref_key_col = _trs.get("key_col", "TextID")   or "TextID"
+        self._text_ref_val_col = _trs.get("val_col", "TextContent") or "TextContent"
+
+        # ── Table-level image preview (shown at top if configured) ─────────────
+        if self._img_col:
+            prev_card = QWidget()
+            prev_card.setStyleSheet(f"background:{_C['panel']};")
+            pclo = QVBoxLayout(prev_card)
+            pclo.setContentsMargins(14, 10, 14, 6); pclo.setSpacing(4)
+            lbl_img = QLabel(f"● IMAGE  [{img_col}]")
+            lbl_img.setStyleSheet(
+                f"color:{_C['txt3']}; font-size:10px; font-weight:600; "
+                f"letter-spacing:1px; background:transparent;"
+            )
+            self._img_preview_label = QLabel("No Image")
+            self._img_preview_label.setAlignment(Qt.AlignCenter)
+            self._img_preview_label.setFixedHeight(160)
+            self._img_preview_label.setStyleSheet(
+                f"background:{_C['code']}; border:1px solid {_C['border']}; "
+                f"border-radius:6px; color:{_C['txt3']}; font-size:12px;"
+            )
+            pclo.addWidget(lbl_img)
+            pclo.addWidget(self._img_preview_label)
+            sep_img = QFrame(); sep_img.setFixedHeight(1)
+            sep_img.setStyleSheet(f"background:{_C['border']}; border:none;")
+            self._form_lo.addWidget(prev_card)
+            self._form_lo.addWidget(sep_img)
 
         for col in df.columns:
             col_conf = cols_cfg.get(col, {})
@@ -832,6 +902,36 @@ class FieldEditorWidget(QWidget):
                     lambda v, c=col, ct=col_type: self._on_numeric(c, v, ct)
                 )
 
+            elif col_type == "text_ref":
+                # Editable string (same as string type) — value IS the lookup key
+                w = QTextEdit()
+                w.setMaximumHeight(76)
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+                # Read-only resolved text label (live-updating)
+                ref_lbl = QLabel("—")
+                ref_lbl.setWordWrap(True)
+                ref_lbl.setStyleSheet(
+                    f"color:#FFFFFF; font-size:13px; font-weight:700; font-style:normal; "
+                    f"background:{_C['code']}; border-radius:4px; padding:4px 8px;"
+                )
+                self._ref_labels[col] = ref_lbl
+
+                def _on_text_ref(c=col, widget=w, lbl=ref_lbl):
+                    val = widget.toPlainText()
+                    self.field_changed.emit(c, val)
+                    self._update_ref_label(lbl, val)
+
+                w.textChanged.connect(_on_text_ref)
+                glo.addWidget(w)
+                glo.addWidget(ref_lbl)
+                self._widgets[col] = w
+                sep = QFrame(); sep.setFixedHeight(1)
+                sep.setStyleSheet(f"background: {_C['border']}; border: none;")
+                self._form_lo.addWidget(grp)   # must parent grp or GC kills the child widgets
+                self._form_lo.addWidget(sep)
+                continue
+
             else:
                 w = QTextEdit()
                 w.setMaximumHeight(76)
@@ -873,6 +973,23 @@ class FieldEditorWidget(QWidget):
             try: float(value); return True
             except ValueError: return False
         return True
+
+    # ── Text-ref lookup ───────────────────────────────────────────────────────
+
+    def _update_ref_label(self, lbl: "QLabel", key_val: str) -> None:
+        if not self._text_ref_json:
+            lbl.setText("（未設定外部文字表）")
+            return
+        if not self._manager:
+            return
+        json_dir = os.path.dirname(self._manager.json_path) if self._manager.json_path else ""
+        abs_ref  = (os.path.join(json_dir, self._text_ref_json)
+                    if json_dir and not os.path.isabs(self._text_ref_json)
+                    else self._text_ref_json)
+        resolved = self._manager.get_ref_text(
+            abs_ref, self._text_ref_key_col, key_val, self._text_ref_val_col
+        )
+        lbl.setText(resolved if resolved else "（找不到對應文字）")
 
     # ── Load row ──────────────────────────────────────────────────────────────
 
@@ -924,11 +1041,31 @@ class FieldEditorWidget(QWidget):
                     w.setText(str(val) if val is not None else "")
                     w.setProperty("invalid", "false")
                     w.style().unpolish(w); w.style().polish(w)
+                elif col_type == "text_ref":
+                    val_str = str(val) if val is not None else ""
+                    w.setPlainText(val_str)
+                    ref_lbl = self._ref_labels.get(col)
+                    if ref_lbl:
+                        self._update_ref_label(ref_lbl, val_str)
                 else:
                     w.setPlainText(str(val) if val is not None else "")
 
             finally:
                 w.blockSignals(False)
+
+        # Update table-level image preview
+        if self._img_col and self._img_preview_label:
+            try:
+                img_val = str(row_data[self._img_col])
+            except Exception:
+                img_val = ""
+            # Resolve base: configured folder first, else JSON dir
+            base = self._img_base_folder
+            if base and not os.path.isabs(base) and self._manager and self._manager.json_path:
+                base = os.path.join(os.path.dirname(self._manager.json_path), base)
+            elif not base and self._manager and self._manager.json_path:
+                base = os.path.dirname(self._manager.json_path)
+            _update_img_thumb(img_val, self._img_preview_label, base)
 
 
 # ── SubTablePanel ─────────────────────────────────────────────────────────────
@@ -1105,11 +1242,12 @@ class TableEditor(QWidget):
         alo.addWidget(_vsep())
 
         for text, role, slot in [
-            ("+ 新增", "primary", self.add_master_item),
-            ("複製",   "",        self.copy_master_item),
-            ("▲",      "ghost",   lambda: self.move_master_item(-1)),
-            ("▼",      "ghost",   lambda: self.move_master_item(1)),
-            ("刪除",   "danger",  self.delete_master_item),
+            ("+ 新增",  "primary", self.add_master_item),
+            ("複製",    "",        self.copy_master_item),
+            ("▲",       "ghost",   lambda: self.move_master_item(-1)),
+            ("▼",       "ghost",   lambda: self.move_master_item(1)),
+            ("刪除",    "danger",  self.delete_master_item),
+            ("⊞ 欄位", "ghost",   self.add_master_column),
         ]:
             b = _mk_btn(text, role)
             b.setFixedHeight(32)
@@ -1211,11 +1349,12 @@ class TableEditor(QWidget):
         sh.addWidget(lbl_sub, 1)
 
         for text, slot in [
-            ("+ 新增", self.add_sub_item),
-            ("複製",   self.copy_sub_item),
-            ("▲",      lambda: self.move_sub_item(-1)),
-            ("▼",      lambda: self.move_sub_item(1)),
-            ("刪除",   self.delete_sub_item),
+            ("+ 新增",  self.add_sub_item),
+            ("複製",    self.copy_sub_item),
+            ("▲",       lambda: self.move_sub_item(-1)),
+            ("▼",       lambda: self.move_sub_item(1)),
+            ("刪除",    self.delete_sub_item),
+            ("⊞ 欄位", self.add_sub_column),
         ]:
             b = _mk_btn(text, "ghost")
             b.setFixedHeight(28)
@@ -1652,6 +1791,41 @@ class TableEditor(QWidget):
             self._load_item_list()
         if self.current_master_idx is not None and self.current_master_idx in self.df.index:
             self._load_editor(self.current_master_idx)
+
+    def add_master_column(self):
+        col_name, ok = QInputDialog.getText(self, "新增欄位", "欄位名稱:")
+        if not ok or not col_name.strip(): return
+        col_name = col_name.strip()
+        if col_name in self.df.columns:
+            QMessageBox.warning(self, "錯誤", f"欄位 [{col_name}] 已存在"); return
+        self.df[col_name] = ""
+        self.manager.tables[self.table_name] = self.df
+        self.manager.dirty = True
+        if self._field_panel:
+            self._field_panel.deleteLater()
+            self._field_panel = None
+        self._reload_all(select_cls=self.current_cls_val, select_idx=self.current_master_idx)
+        self.status_message.emit(f"欄位 [{col_name}] 已新增", _C["green"])
+
+    def add_sub_column(self):
+        tab_idx = self._sub_tabs.currentIndex()
+        if tab_idx < 0: return
+        tab_name = self._sub_tabs.tabText(tab_idx)
+        if not tab_name or tab_name == "—": return
+        full   = self.table_name + "." + tab_name
+        sub_df = self.manager.sub_tables.get(full)
+        if sub_df is None: return
+        col_name, ok = QInputDialog.getText(self, "新增欄位", f"欄位名稱（子表: {tab_name}）:")
+        if not ok or not col_name.strip(): return
+        col_name = col_name.strip()
+        if col_name in sub_df.columns:
+            QMessageBox.warning(self, "錯誤", f"欄位 [{col_name}] 已存在"); return
+        sub_df[col_name] = ""
+        self.manager.sub_tables[full] = sub_df
+        self.manager.dirty = True
+        self._build_sub_tabs()
+        self._refresh_sub_tables()
+        self.status_message.emit(f"從表欄位 [{col_name}] 已新增", _C["green"])
 
     def reload_after_config(self):
         self.cfg     = self.manager.config.get(self.table_name, {})
@@ -2169,8 +2343,13 @@ class App(QMainWindow):
         self._show_config_dialog(tname)
 
     def _show_config_dialog(self, table_name):
+        _btn_ss = (
+            f"background:{_C['input']}; border:1px solid {_C['border']}; "
+            f"color:{_C['txtAcc']}; border-radius:5px; padding:3px 10px; text-align:left;"
+        )
+
         # ── Helper: enum options editor button ────────────────────────────────
-        def _make_opts_btn(parent_dlg, cur_opts, col_label):
+        def _make_opts_btn(parent_dlg, cur_opts, col_label, df_source=None, col_name_str=None):
             """Return (button, opts_store) where opts_store[0] is the live list."""
             opts_store = [list(cur_opts)]
 
@@ -2179,20 +2358,17 @@ class App(QMainWindow):
                 return f"選項: {n}個  ✎" if n else "設定選項…"
 
             btn = QPushButton(_label())
-            btn.setStyleSheet(
-                f"background:{_C['input']}; border:1px solid {_C['border']}; "
-                f"color:{_C['txtAcc']}; border-radius:5px; padding:3px 10px; text-align:left;"
-            )
+            btn.setStyleSheet(_btn_ss)
 
             def _open():
                 od = QDialog(parent_dlg)
                 od.setWindowTitle(f"Enum 選項 — {col_label}")
-                od.resize(320, 380)
+                od.resize(340, 420)
                 od.setStyleSheet(APP_QSS)
                 ov = QVBoxLayout(od)
                 ov.setContentsMargins(16, 16, 16, 16); ov.setSpacing(8)
 
-                hint = QLabel("雙擊選項可編輯；刪除後重新新增可改名")
+                hint = QLabel("雙擊選項可編輯；拖曳可排序")
                 hint.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
                 ov.addWidget(hint)
 
@@ -2202,7 +2378,7 @@ class App(QMainWindow):
                     f"border-radius:5px; color:{_C['txt']};"
                 )
                 lw.addItems([str(o) for o in opts_store[0]])
-                lw.setDragDropMode(QAbstractItemView.InternalMove)  # reorder by drag
+                lw.setDragDropMode(QAbstractItemView.InternalMove)
                 lw.setSelectionMode(QAbstractItemView.SingleSelection)
                 ov.addWidget(lw, 1)
 
@@ -2212,11 +2388,31 @@ class App(QMainWindow):
                 add_btn = _mk_btn("+ 新增", "primary"); add_btn.setFixedHeight(30)
                 def _add():
                     t = inp.text().strip()
-                    if t:
+                    if t and not any(lw.item(i).text() == t for i in range(lw.count())):
                         lw.addItem(t); inp.clear()
                 add_btn.clicked.connect(_add); inp.returnPressed.connect(_add)
                 il.addWidget(inp, 1); il.addWidget(add_btn)
                 ov.addWidget(inp_row)
+
+                # Auto-collect button: scan df_source column for unique values
+                if df_source is not None and col_name_str and col_name_str in df_source.columns:
+                    auto_btn = _mk_btn("⟳ 從資料自動收集", "secondary"); auto_btn.setFixedHeight(30)
+                    def _auto_collect():
+                        existing = {lw.item(i).text() for i in range(lw.count())}
+                        vals = df_source[col_name_str].dropna().astype(str).unique()
+                        added = 0
+                        for v in sorted(vals):
+                            v = v.strip()
+                            if v and v not in existing:
+                                lw.addItem(v)
+                                existing.add(v)
+                                added += 1
+                        if added == 0:
+                            hint.setText("（所有現有值已包含在選項中）")
+                        else:
+                            hint.setText(f"已新增 {added} 個選項")
+                    auto_btn.clicked.connect(_auto_collect)
+                    ov.addWidget(auto_btn)
 
                 del_btn = _mk_btn("刪除選取項目", "danger"); del_btn.setFixedHeight(30)
                 def _del():
@@ -2236,19 +2432,24 @@ class App(QMainWindow):
             btn.clicked.connect(_open)
             return btn, opts_store
 
-        def _col_row(col, cfg_cols, parent_dlg):
+        def _col_row(col, cfg_cols, parent_dlg, df_source=None):
             """Return (row_widget, combo, opts_store) for one column."""
             rw  = QWidget(); rw.setStyleSheet("background:transparent;")
             rlo = QHBoxLayout(rw)
             rlo.setContentsMargins(0, 0, 0, 0); rlo.setSpacing(6)
             cb = _NoscrollCombo()
-            cb.addItems(["string", "int", "float", "bool", "enum"])
+            cb.addItems(["string", "int", "float", "bool", "enum", "text_ref"])
             cur_type = cfg_cols.get(col, {}).get("type", "string")
             cb.setCurrentText(cur_type)
+
             cur_opts = cfg_cols.get(col, {}).get("options", [])
-            opts_btn, opts_store = _make_opts_btn(parent_dlg, cur_opts, col)
+            opts_btn, opts_store = _make_opts_btn(
+                parent_dlg, cur_opts, col,
+                df_source=df_source, col_name_str=col
+            )
             opts_btn.setVisible(cur_type == "enum")
-            cb.currentTextChanged.connect(lambda t, w=opts_btn: w.setVisible(t == "enum"))
+            cb.currentTextChanged.connect(lambda t, ob=opts_btn: ob.setVisible(t == "enum"))
+
             rlo.addWidget(cb)
             rlo.addWidget(opts_btn, 1)
             return rw, cb, opts_store
@@ -2303,6 +2504,54 @@ class App(QMainWindow):
         vlo.addWidget(_form_row("Primary Key",         pk_var))
         vlo.addWidget(_form_row("Classification Key",  cls_var))
 
+        img_cols = ["（無）"] + cols
+        img_var  = _NoscrollCombo(); img_var.addItems(img_cols)
+        cur_img  = cfg.get("image_preview", {}).get("col", "")
+        img_var.setCurrentText(cur_img if cur_img in cols else "（無）")
+        vlo.addWidget(_form_row("Image Preview 欄位", img_var))
+
+        # Image base folder row: [edit] [Browse folder]
+        def _browse_row(edit, is_folder=False):
+            row = QWidget(); row.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(row); rl.setContentsMargins(0,0,0,0); rl.setSpacing(4)
+            btn = QPushButton("…"); btn.setFixedWidth(32)
+            btn.setStyleSheet(
+                f"background:{_C['card']}; border:1px solid {_C['border']}; "
+                f"color:{_C['txt']}; border-radius:5px;"
+            )
+            def _browse():
+                base = os.path.dirname(self.manager.json_path) if self.manager.json_path else ""
+                if is_folder:
+                    from PySide6.QtWidgets import QFileDialog as _QFD
+                    p = _QFD.getExistingDirectory(dlg, "選擇資料夾", base)
+                else:
+                    from PySide6.QtWidgets import QFileDialog as _QFD
+                    p, _ = _QFD.getOpenFileName(dlg, "選擇檔案", base, "JSON (*.json)")
+                if p:
+                    try: p = os.path.relpath(p, base) if base else p
+                    except ValueError: pass
+                    edit.setText(p)
+            btn.clicked.connect(_browse)
+            rl.addWidget(edit, 1); rl.addWidget(btn)
+            return row
+
+        img_folder_edit = QLineEdit(cfg.get("image_preview", {}).get("base_folder", ""))
+        img_folder_edit.setPlaceholderText("圖片根目錄（相對路徑或絕對路徑）")
+        vlo.addWidget(_form_row("Image 資料夾路徑", _browse_row(img_folder_edit, is_folder=True)))
+
+        # External text-ref JSON path row
+        _trs_cfg = cfg.get("text_ref_source", {})
+        text_ref_edit = QLineEdit(_trs_cfg.get("json_path", ""))
+        text_ref_edit.setPlaceholderText("外部文字表路徑（相對路徑或絕對路徑）")
+        vlo.addWidget(_form_row("外部文字表路徑", _browse_row(text_ref_edit, is_folder=False)))
+
+        trs_key_edit = QLineEdit(_trs_cfg.get("key_col", "TextID"))
+        trs_key_edit.setPlaceholderText("key 欄名（預設 TextID）")
+        trs_val_edit = QLineEdit(_trs_cfg.get("val_col", "TextContent"))
+        trs_val_edit.setPlaceholderText("value 欄名（預設 TextContent）")
+        vlo.addWidget(_form_row("  文字表 Key 欄", trs_key_edit))
+        vlo.addWidget(_form_row("  文字表 Val 欄", trs_val_edit))
+
         sep1 = QFrame(); sep1.setFixedHeight(1)
         sep1.setStyleSheet(f"background:{_C['border']}; border:none;")
         vlo.addWidget(sep1)
@@ -2310,7 +2559,7 @@ class App(QMainWindow):
 
         main_col_widgets: dict[str, tuple] = {}  # col → (cb, opts_store)
         for col in cols:
-            rw, cb, opts_store = _col_row(col, cols_cfg, dlg)
+            rw, cb, opts_store = _col_row(col, cols_cfg, dlg, df_source=df)
             vlo.addWidget(_form_row(f"  {col}", rw))
             main_col_widgets[col] = (cb, opts_store)
 
@@ -2347,7 +2596,7 @@ class App(QMainWindow):
 
                 col_combos: dict[str, tuple] = {}
                 for scol in list(sub_df.columns):
-                    rw, cb, opts_store = _col_row(scol, sub_cols_cfg, dlg)
+                    rw, cb, opts_store = _col_row(scol, sub_cols_cfg, dlg, df_source=sub_df)
                     vlo.addWidget(_form_row(f"    {scol}", rw))
                     col_combos[scol] = (cb, opts_store)
 
@@ -2383,12 +2632,33 @@ class App(QMainWindow):
         # ── Apply ─────────────────────────────────────────────────────────────
         cfg["primary_key"]        = pk_var.currentText()
         cfg["classification_key"] = cls_var.currentText()
+        img_col_val    = img_var.currentText()
+        img_folder_val = img_folder_edit.text().strip()
+        if img_col_val and img_col_val != "（無）":
+            cfg["image_preview"] = {"col": img_col_val}
+            if img_folder_val:
+                cfg["image_preview"]["base_folder"] = img_folder_val
+        else:
+            cfg.pop("image_preview", None)
+
+        text_ref_path = text_ref_edit.text().strip()
+        if text_ref_path:
+            cfg["text_ref_source"] = {
+                "json_path": text_ref_path,
+                "key_col":   trs_key_edit.text().strip() or "TextID",
+                "val_col":   trs_val_edit.text().strip() or "TextContent",
+            }
+        else:
+            cfg.pop("text_ref_source", None)
+        def _build_col_entry(t, opts_store):
+            entry = {"type": t}
+            if t == "enum" and opts_store[0]:
+                entry["options"] = opts_store[0]
+            return entry
+
         cfg.setdefault("columns", {})
         for col, (cb, opts_store) in main_col_widgets.items():
-            entry = {"type": cb.currentText()}
-            if cb.currentText() == "enum" and opts_store[0]:
-                entry["options"] = opts_store[0]
-            cfg["columns"][col] = entry
+            cfg["columns"][col] = _build_col_entry(cb.currentText(), opts_store)
 
         cfg.setdefault("sub_tables", {})
         for tab_name, data in sub_widgets.items():
@@ -2398,10 +2668,7 @@ class App(QMainWindow):
                 st["foreign_key"] = fk
             st.setdefault("columns", {})
             for scol, (scb, opts_store) in data["col_combos"].items():
-                entry = {"type": scb.currentText()}
-                if scb.currentText() == "enum" and opts_store[0]:
-                    entry["options"] = opts_store[0]
-                st["columns"][scol] = entry
+                st["columns"][scol] = _build_col_entry(scb.currentText(), opts_store)
 
         self.manager.config[table_name] = cfg
         self.manager.save_config()
