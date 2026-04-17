@@ -216,13 +216,37 @@ QComboBox {{
     color: {_C['txt']};
 }}
 QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox::down-arrow {{
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {_C['txt2']};
+    margin-right: 6px;
+}}
 QComboBox:focus {{ border-color: {_C['accent']}; }}
+QComboBox:disabled {{ color: {_C['txt3']}; }}
 QComboBox QAbstractItemView {{
-    background: {_C['panel']};
-    border: 1px solid {_C['border']};
-    selection-background-color: rgba(99,102,241,0.25);
+    background-color: {_C['card']};
+    border: 1px solid {_C['borderH']};
     color: {_C['txt']};
+    selection-background-color: {_C['accent']};
+    selection-color: #FFFFFF;
     outline: none;
+    padding: 2px;
+}}
+QComboBox QAbstractItemView::item {{
+    color: {_C['txt']};
+    background-color: transparent;
+    padding: 5px 10px;
+    min-height: 22px;
+}}
+QComboBox QAbstractItemView::item:hover {{
+    background-color: {_C['cardH']};
+    color: {_C['txt']};
+}}
+QComboBox QAbstractItemView::item:selected {{
+    background-color: {_C['accent']};
+    color: #FFFFFF;
 }}
 QCheckBox::indicator {{
     width: 15px; height: 15px;
@@ -413,6 +437,45 @@ class _SaveWorker(QThread):
             self.done.emit()
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ── Non-scroll ComboBox (used in config dialog) ───────────────────────────────
+
+class _NoscrollCombo(QComboBox):
+    """ComboBox that ignores scroll wheel unless the user explicitly clicked into it."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(Qt.StrongFocus)   # only gain focus via click/tab, NOT wheel
+        # Force dropdown popup colours directly on the internal QListView;
+        # app-level QSS does not always cascade into the floating popup on Windows.
+        self.view().setStyleSheet(
+            f"QListView {{"
+            f"  background-color: {_C['card']};"
+            f"  color: {_C['txt']};"
+            f"  border: 1px solid {_C['borderH']};"
+            f"  outline: none;"
+            f"}}"
+            f"QListView::item {{"
+            f"  color: {_C['txt']};"
+            f"  background-color: transparent;"
+            f"  padding: 4px 10px;"
+            f"  min-height: 22px;"
+            f"}}"
+            f"QListView::item:hover {{"
+            f"  background-color: {_C['cardH']};"
+            f"  color: {_C['txt']};"
+            f"}}"
+            f"QListView::item:selected {{"
+            f"  background-color: {_C['accent']};"
+            f"  color: #FFFFFF;"
+            f"}}"
+        )
+
+    def wheelEvent(self, e):
+        if self.hasFocus():
+            super().wheelEvent(e)
+        else:
+            e.ignore()
 
 
 # ── ItemCardDelegate ──────────────────────────────────────────────────────────
@@ -757,7 +820,7 @@ class FieldEditorWidget(QWidget):
 
             elif col_type == "enum":
                 opts = col_conf.get("options") or [""]
-                w = QComboBox()
+                w = _NoscrollCombo()
                 w.addItems([str(o) for o in opts])
                 w.currentTextChanged.connect(
                     lambda v, c=col: self.field_changed.emit(c, v)
@@ -1166,9 +1229,12 @@ class TableEditor(QWidget):
         self._sub_tabs.setObjectName("sub-tabs")
         self._sub_tabs.setDocumentMode(True)
         sv.addWidget(self._sub_tabs, 1)
+        sub_area.setMinimumHeight(110)     # ensure header + tab bar always visible
         rsplit.addWidget(sub_area)
 
         rsplit.setSizes([360, 200])
+        rsplit.setCollapsible(0, False)
+        rsplit.setCollapsible(1, False)
         rv.addWidget(rsplit, 1)
         root.addWidget(right)
 
@@ -1416,27 +1482,53 @@ class TableEditor(QWidget):
                 continue
             tab_name = key[len(prefix):]
             self._sub_tab_order.append(tab_name)
-            self._sub_tabs.addTab(QWidget(), tab_name)
+            # Create the real panel immediately — no placeholder swap needed
+            sub_cfg  = self.cfg.get("sub_tables", {}).get(tab_name, {})
+            cols_cfg = sub_cfg.get("columns", {})
+            panel = SubTablePanel(key, cols_cfg, self.manager)
+            panel.row_deleted.connect(self._on_sub_delete)
+            self._sub_panels[tab_name] = panel
+            self._sub_tabs.addTab(panel, tab_name)
+
+        if not self._sub_tab_order:
+            no_sub = QLabel("此表格無巢狀子表")
+            no_sub.setAlignment(Qt.AlignCenter)
+            no_sub.setStyleSheet(
+                f"color:{_C['txt3']}; font-size:12px; background:{_C['panel']};"
+            )
+            self._sub_tabs.addTab(no_sub, "—")
+
+        self.status_message.emit(
+            f"從表: 偵測到 {len(self._sub_tab_order)} 個"
+            + (f"  ({', '.join(self._sub_tab_order)})" if self._sub_tab_order else ""),
+            _C["txt2"],
+        )
 
     def _refresh_sub_tables(self):
-        if self.current_master_pk is None: return
+        """Reload each sub-table panel with rows matching the currently selected master pk."""
+        if self.current_master_pk is None:
+            return
         prefix = self.table_name + "."
-        for i, tab_name in enumerate(self._sub_tab_order):
+        for tab_name in self._sub_tab_order:
+            panel = self._sub_panels.get(tab_name)
+            if panel is None:
+                continue
             full   = prefix + tab_name
             sub_df = self.manager.sub_tables.get(full)
-            if sub_df is None: continue
+            if sub_df is None:
+                continue
             sub_cfg  = self.cfg.get("sub_tables", {}).get(tab_name, {})
             fk_key   = sub_cfg.get("foreign_key", self.pk_key)
             cols_cfg = sub_cfg.get("columns", {})
-            filtered = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
-
-            if tab_name not in self._sub_panels:
-                panel = SubTablePanel(full, cols_cfg, self.manager)
-                panel.row_deleted.connect(self._on_sub_delete)
-                self._sub_panels[tab_name] = panel
-                self._sub_tabs.removeTab(i)
-                self._sub_tabs.insertTab(i, panel, tab_name)
-            self._sub_panels[tab_name].reload(filtered, cols_cfg)
+            try:
+                filtered = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
+            except KeyError:
+                # FK column not found — fall back to first column
+                fk_key   = sub_df.columns[0] if len(sub_df.columns) > 0 else None
+                if fk_key is None:
+                    continue
+                filtered = sub_df[sub_df[fk_key].astype(str) == str(self.current_master_pk)]
+            panel.reload(filtered, cols_cfg)
 
     def _on_sub_delete(self, sheet_full, df_idx):
         sub_df = self.manager.sub_tables.get(sheet_full)
@@ -2077,60 +2169,240 @@ class App(QMainWindow):
         self._show_config_dialog(tname)
 
     def _show_config_dialog(self, table_name):
+        # ── Helper: enum options editor button ────────────────────────────────
+        def _make_opts_btn(parent_dlg, cur_opts, col_label):
+            """Return (button, opts_store) where opts_store[0] is the live list."""
+            opts_store = [list(cur_opts)]
+
+            def _label():
+                n = len(opts_store[0])
+                return f"選項: {n}個  ✎" if n else "設定選項…"
+
+            btn = QPushButton(_label())
+            btn.setStyleSheet(
+                f"background:{_C['input']}; border:1px solid {_C['border']}; "
+                f"color:{_C['txtAcc']}; border-radius:5px; padding:3px 10px; text-align:left;"
+            )
+
+            def _open():
+                od = QDialog(parent_dlg)
+                od.setWindowTitle(f"Enum 選項 — {col_label}")
+                od.resize(320, 380)
+                od.setStyleSheet(APP_QSS)
+                ov = QVBoxLayout(od)
+                ov.setContentsMargins(16, 16, 16, 16); ov.setSpacing(8)
+
+                hint = QLabel("雙擊選項可編輯；刪除後重新新增可改名")
+                hint.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+                ov.addWidget(hint)
+
+                lw = QListWidget()
+                lw.setStyleSheet(
+                    f"background:{_C['input']}; border:1px solid {_C['border']}; "
+                    f"border-radius:5px; color:{_C['txt']};"
+                )
+                lw.addItems([str(o) for o in opts_store[0]])
+                lw.setDragDropMode(QAbstractItemView.InternalMove)  # reorder by drag
+                lw.setSelectionMode(QAbstractItemView.SingleSelection)
+                ov.addWidget(lw, 1)
+
+                inp_row = QWidget(); inp_row.setStyleSheet("background:transparent;")
+                il = QHBoxLayout(inp_row); il.setContentsMargins(0, 0, 0, 0); il.setSpacing(6)
+                inp = QLineEdit(); inp.setPlaceholderText("輸入新選項名稱")
+                add_btn = _mk_btn("+ 新增", "primary"); add_btn.setFixedHeight(30)
+                def _add():
+                    t = inp.text().strip()
+                    if t:
+                        lw.addItem(t); inp.clear()
+                add_btn.clicked.connect(_add); inp.returnPressed.connect(_add)
+                il.addWidget(inp, 1); il.addWidget(add_btn)
+                ov.addWidget(inp_row)
+
+                del_btn = _mk_btn("刪除選取項目", "danger"); del_btn.setFixedHeight(30)
+                def _del():
+                    for it in lw.selectedItems():
+                        lw.takeItem(lw.row(it))
+                del_btn.clicked.connect(_del)
+                ov.addWidget(del_btn)
+
+                bb2 = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                bb2.accepted.connect(od.accept); bb2.rejected.connect(od.reject)
+                ov.addWidget(bb2)
+
+                if od.exec() == QDialog.Accepted:
+                    opts_store[0] = [lw.item(ii).text() for ii in range(lw.count())]
+                    btn.setText(_label())
+
+            btn.clicked.connect(_open)
+            return btn, opts_store
+
+        def _col_row(col, cfg_cols, parent_dlg):
+            """Return (row_widget, combo, opts_store) for one column."""
+            rw  = QWidget(); rw.setStyleSheet("background:transparent;")
+            rlo = QHBoxLayout(rw)
+            rlo.setContentsMargins(0, 0, 0, 0); rlo.setSpacing(6)
+            cb = _NoscrollCombo()
+            cb.addItems(["string", "int", "float", "bool", "enum"])
+            cur_type = cfg_cols.get(col, {}).get("type", "string")
+            cb.setCurrentText(cur_type)
+            cur_opts = cfg_cols.get(col, {}).get("options", [])
+            opts_btn, opts_store = _make_opts_btn(parent_dlg, cur_opts, col)
+            opts_btn.setVisible(cur_type == "enum")
+            cb.currentTextChanged.connect(lambda t, w=opts_btn: w.setVisible(t == "enum"))
+            rlo.addWidget(cb)
+            rlo.addWidget(opts_btn, 1)
+            return rw, cb, opts_store
+
+        # ── Dialog ────────────────────────────────────────────────────────────
         dlg = QDialog(self)
         dlg.setWindowTitle(f"配置 — {table_name}")
-        dlg.setMinimumWidth(480)
+        dlg.setMinimumWidth(520)
+        dlg.resize(540, 660)
         dlg.setStyleSheet(APP_QSS)
 
-        cfg  = self.manager.config.get(table_name, {})
-        df   = self.manager.tables[table_name]
-        cols = list(df.columns)
+        cfg      = self.manager.config.get(table_name, {})
+        df       = self.manager.tables[table_name]
+        cols     = list(df.columns)
+        cols_cfg = cfg.get("columns", {})
 
         outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         content = QWidget(); content.setStyleSheet(f"background:{_C['panel']};")
-        form = QFormLayout(content)
-        form.setContentsMargins(16, 16, 16, 16)
-        form.setSpacing(10)
+        vlo = QVBoxLayout(content)
+        vlo.setContentsMargins(16, 16, 16, 16)
+        vlo.setSpacing(12)
         scroll.setWidget(content)
-        outer.addWidget(scroll)
+        outer.addWidget(scroll, 1)
 
-        pk_var  = QComboBox(); pk_var.addItems(cols)
-        cls_var = QComboBox(); cls_var.addItems(cols)
-        pk_var.setCurrentText(cfg.get("primary_key",        cols[0] if cols else ""))
+        # ── Main table keys ───────────────────────────────────────────────────
+        def _sec(text):
+            lbl = QLabel(text.upper())
+            lbl.setStyleSheet(
+                f"color:{_C['txt3']}; font-size:10px; font-weight:600; "
+                f"letter-spacing:1px; background:transparent;"
+            )
+            return lbl
+
+        def _form_row(label_text, widget):
+            w = QWidget(); w.setStyleSheet("background:transparent;")
+            h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0); h.setSpacing(10)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(160)
+            lbl.setStyleSheet(f"color:{_C['txt2']}; background:transparent;")
+            h.addWidget(lbl); h.addWidget(widget, 1)
+            return w
+
+        vlo.addWidget(_sec("主表設定"))
+        pk_var  = _NoscrollCombo(); pk_var.addItems(cols)
+        cls_var = _NoscrollCombo(); cls_var.addItems(cols)
+        pk_var.setCurrentText(cfg.get("primary_key",         cols[0] if cols else ""))
         cls_var.setCurrentText(cfg.get("classification_key", cols[0] if cols else ""))
-        form.addRow("Primary Key:", pk_var)
-        form.addRow("Classification Key:", cls_var)
+        vlo.addWidget(_form_row("Primary Key",         pk_var))
+        vlo.addWidget(_form_row("Classification Key",  cls_var))
 
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f"background:{_C['border']};")
-        form.addRow(sep)
-        form.addRow(QLabel("欄位類型:"))
+        sep1 = QFrame(); sep1.setFixedHeight(1)
+        sep1.setStyleSheet(f"background:{_C['border']}; border:none;")
+        vlo.addWidget(sep1)
+        vlo.addWidget(_sec("主表欄位類型"))
 
-        col_type_combos = {}
-        cols_cfg = cfg.get("columns", {})
+        main_col_widgets: dict[str, tuple] = {}  # col → (cb, opts_store)
         for col in cols:
-            cb = QComboBox()
-            cb.addItems(["string", "int", "float", "bool", "enum"])
-            cb.setCurrentText(cols_cfg.get(col, {}).get("type", "string"))
-            form.addRow(f"  {col}:", cb)
-            col_type_combos[col] = cb
+            rw, cb, opts_store = _col_row(col, cols_cfg, dlg)
+            vlo.addWidget(_form_row(f"  {col}", rw))
+            main_col_widgets[col] = (cb, opts_store)
 
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        outer.addWidget(bb)
+        # ── Sub-tables ────────────────────────────────────────────────────────
+        prefix = table_name + "."
+        sub_keys = [k for k in self.manager.sub_tables if k.startswith(prefix)]
+        sub_widgets: dict[str, dict] = {}  # tab_name → {fk_edit, col_combos}
+
+        if sub_keys:
+            sep2 = QFrame(); sep2.setFixedHeight(1)
+            sep2.setStyleSheet(f"background:{_C['border']}; border:none;")
+            vlo.addSpacing(4); vlo.addWidget(sep2)
+            vlo.addWidget(_sec("從表設定"))
+
+            sub_cfg_root = cfg.get("sub_tables", {})
+
+            for full_key in sub_keys:
+                tab_name     = full_key[len(prefix):]
+                sub_df       = self.manager.sub_tables[full_key]
+                sub_cfg      = sub_cfg_root.get(tab_name, {})
+                sub_cols_cfg = sub_cfg.get("columns", {})
+
+                shdr = QLabel(f"▸  {tab_name}")
+                shdr.setStyleSheet(
+                    f"color:{_C['txtAcc']}; font-size:12px; font-weight:600; "
+                    f"background:transparent; padding-top:6px;"
+                )
+                vlo.addWidget(shdr)
+
+                fk_edit = QLineEdit()
+                fk_edit.setPlaceholderText("foreign_key 欄位名稱")
+                fk_edit.setText(sub_cfg.get("foreign_key", ""))
+                vlo.addWidget(_form_row("  Foreign Key", fk_edit))
+
+                col_combos: dict[str, tuple] = {}
+                for scol in list(sub_df.columns):
+                    rw, cb, opts_store = _col_row(scol, sub_cols_cfg, dlg)
+                    vlo.addWidget(_form_row(f"    {scol}", rw))
+                    col_combos[scol] = (cb, opts_store)
+
+                sub_widgets[tab_name] = {"fk_edit": fk_edit, "col_combos": col_combos}
+
+        else:
+            # Inform user if no sub-tables detected
+            no_sub = QLabel("（此表格在 JSON 中無巢狀陣列資料，故無從表）")
+            no_sub.setStyleSheet(f"color:{_C['txt3']}; font-size:11px; background:transparent;")
+            vlo.addWidget(no_sub)
+
+        vlo.addStretch(1)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        bb_w = QWidget()
+        bb_w.setStyleSheet(
+            f"background:{_C['sidebar']}; border-top:1px solid {_C['border']};"
+        )
+        bb_lo = QHBoxLayout(bb_w)
+        bb_lo.setContentsMargins(16, 10, 16, 10)
+        bb_lo.setSpacing(8)
+        bb_lo.addStretch(1)
+        btn_ok  = _mk_btn("套用", "primary"); btn_ok.setFixedHeight(34)
+        btn_can = _mk_btn("取消");             btn_can.setFixedHeight(34)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_can.clicked.connect(dlg.reject)
+        bb_lo.addWidget(btn_can); bb_lo.addWidget(btn_ok)
+        outer.addWidget(bb_w)
 
         if dlg.exec() != QDialog.Accepted:
             return
 
+        # ── Apply ─────────────────────────────────────────────────────────────
         cfg["primary_key"]        = pk_var.currentText()
         cfg["classification_key"] = cls_var.currentText()
-        if "columns" not in cfg:
-            cfg["columns"] = {}
-        for col, cb in col_type_combos.items():
-            cfg["columns"].setdefault(col, {})["type"] = cb.currentText()
+        cfg.setdefault("columns", {})
+        for col, (cb, opts_store) in main_col_widgets.items():
+            entry = {"type": cb.currentText()}
+            if cb.currentText() == "enum" and opts_store[0]:
+                entry["options"] = opts_store[0]
+            cfg["columns"][col] = entry
+
+        cfg.setdefault("sub_tables", {})
+        for tab_name, data in sub_widgets.items():
+            st = cfg["sub_tables"].setdefault(tab_name, {})
+            fk = data["fk_edit"].text().strip()
+            if fk:
+                st["foreign_key"] = fk
+            st.setdefault("columns", {})
+            for scol, (scb, opts_store) in data["col_combos"].items():
+                entry = {"type": scb.currentText()}
+                if scb.currentText() == "enum" and opts_store[0]:
+                    entry["options"] = opts_store[0]
+                st["columns"][scol] = entry
+
         self.manager.config[table_name] = cfg
         self.manager.save_config()
         editor = self._editors.get(table_name)
