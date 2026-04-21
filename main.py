@@ -1180,8 +1180,8 @@ class TableEditor(QWidget):
         self.df         = manager.tables[table_name]
         self.cfg        = manager.config.get(table_name, {})
         cols            = list(self.df.columns)
-        self.cls_key    = self.cfg.get("classification_key", cols[0] if cols else "")
-        self.pk_key     = self.cfg.get("primary_key",        cols[0] if cols else "")
+        self.cls_key    = self.cfg.get("classification_key", "") or (cols[0] if cols else "")
+        self.pk_key     = self.cfg.get("primary_key",        "") or (cols[0] if cols else "")
 
         self.current_cls_val    = None
         self.current_master_idx = None
@@ -1455,6 +1455,18 @@ class TableEditor(QWidget):
         self._load_item_list()
 
     def add_classification(self):
+        if self.cls_key not in self.df.columns:
+            col, ok = QInputDialog.getText(self, "設定分類欄位", "分類欄位名稱:")
+            if not ok or not col.strip():
+                return
+            col = col.strip()
+            self.manager.add_column(self.table_name, col)
+            self.df = self.manager.tables[self.table_name]
+            self.cls_key = col
+            self.cfg["classification_key"] = col
+            if not self.pk_key or self.pk_key not in self.df.columns:
+                self.pk_key = col
+                self.cfg["primary_key"] = col
         name, ok = QInputDialog.getText(self, "新增分類", "分類名稱:")
         if not ok or not name.strip():
             return
@@ -1463,7 +1475,7 @@ class TableEditor(QWidget):
             QMessageBox.warning(self, "錯誤", "此分類已存在"); return
         new_row = {col: "" for col in self.df.columns}
         new_row[self.cls_key] = name
-        if self.pk_key in self.df.columns:
+        if self.pk_key in self.df.columns and self.pk_key != self.cls_key:
             new_id, ok2 = QInputDialog.getText(self, "新增分類", f"首筆資料的 {self.pk_key}:")
             if not ok2 or not new_id.strip(): return
             new_row[self.pk_key] = new_id.strip()
@@ -1880,8 +1892,8 @@ class TableEditor(QWidget):
     def reload_after_config(self):
         self.cfg     = self.manager.config.get(self.table_name, {})
         cols         = list(self.df.columns)
-        self.cls_key = self.cfg.get("classification_key", cols[0] if cols else "")
-        self.pk_key  = self.cfg.get("primary_key",        cols[0] if cols else "")
+        self.cls_key = self.cfg.get("classification_key", "") or (cols[0] if cols else "")
+        self.pk_key  = self.cfg.get("primary_key",        "") or (cols[0] if cols else "")
         if self._field_panel:
             self._field_panel.deleteLater()
             self._field_panel = None
